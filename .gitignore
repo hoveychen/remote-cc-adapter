@@ -19,6 +19,7 @@ native/**/build/
 
 # Agent scratch state
 TASKS.md
+.worktrees/
 
 # OS
 .DS_Store

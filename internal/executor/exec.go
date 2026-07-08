@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -34,9 +35,13 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = req.Cwd
-	if len(req.Env) > 0 {
-		cmd.Env = req.Env
+	// Mark the child as running in the remote executor context so downstream
+	// tooling (and the e2e tests) can detect remote execution.
+	base := req.Env
+	if len(base) == 0 {
+		base = os.Environ()
 	}
+	cmd.Env = append(append([]string(nil), base...), "RCC_EXECUTOR=1")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
