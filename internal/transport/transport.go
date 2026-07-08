@@ -2,12 +2,13 @@
 // (internal/protocol) is decoupled from how bytes actually travel.
 //
 // The adapter (brain) uses a Dialer to open RPC streams to the executor; the
-// executor uses a Listener to accept them. Today the only implemented transport
-// is a local Unix-domain socket (UnixDialer/UnixListener), which lets the whole
-// pipeline run end-to-end on one host. The design target is go-libp2p (DCUtR
-// hole-punching + circuit-relay fallback, Noise/TLS, PeerID == public key); it
-// is present as a compile-time stub (Libp2pDialer/Libp2pListener) so callers can
-// already program against the interface. See design doc §3.3.
+// executor uses a Listener to accept them. Two transports are implemented:
+//
+//   - Unix-domain socket (UnixDialer/UnixListener): the whole pipeline on one
+//     host.
+//   - go-libp2p (Libp2pDialer/Libp2pListener, libp2p.go): crossing machines,
+//     Noise/TLS-secured with PeerID == public key, DCUtR hole-punching and
+//     circuit-relay fallback for NAT traversal. See design doc §3.3.
 package transport
 
 import (

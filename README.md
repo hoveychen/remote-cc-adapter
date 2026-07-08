@@ -11,10 +11,12 @@ tool *implementations* are untouched. Only the syscalls beneath them
 > **Status: early implementation, POC-validated design.** The core interception
 > mechanisms were validated end-to-end in a proof of concept on both macOS and
 > Linux (see [`docs/design.md`](docs/design.md) §4). This repository promotes
-> that POC into a structured, buildable codebase. The full Go pipeline
-> (routing → relay → executor) is covered by tests; the native↔real-`claude`
-> injection path and the cross-machine transport are the next milestones. See
-> [Status & roadmap](#status--roadmap) for exactly what is and isn't wired.
+> that POC into a structured, buildable codebase: the full Go pipeline is tested,
+> real-`claude` injection is verified end-to-end on macOS (Read/Write/Bash/
+> subagent/Grep/Glob), and filesystem IO-RPC runs over go-libp2p between hosts.
+> Bridging the subprocess path across machines and NAT-traversal field testing
+> are the next milestones. See [Status & roadmap](#status--roadmap) for exactly
+> what is and isn't wired.
 
 ## How it works
 
@@ -70,7 +72,7 @@ three rejected designs — is in [`docs/design.md`](docs/design.md) §2.
 | [`internal/protocol`](internal/protocol) | Binary fs IO-RPC wire format (shared C↔Go↔Go). |
 | [`internal/execproto`](internal/execproto) | Streaming subprocess protocol (proxy↔executor). |
 | [`internal/routing`](internal/routing) | Path routing table (remote-allowlist / default-remote). |
-| [`internal/transport`](internal/transport) | Brain↔executor link: Unix socket (now), go-libp2p (stub). |
+| [`internal/transport`](internal/transport) | Brain↔executor link: Unix socket + go-libp2p. |
 | [`internal/executor`](internal/executor) | fs + subprocess services and stream multiplexing. |
 | [`internal/adapter`](internal/adapter) | IO-RPC server, routing relay, claude launch/injection. |
 | [`native/macos`](native/macos) | DYLD interpose dylib. |
@@ -119,6 +121,31 @@ On Linux, drop `--resign`/`--dylib` and pass
 `--print-cmd` prints the assembled launch command and injected environment
 without spawning anything — handy for inspecting exactly what would run.
 
+## Run (cross-machine over libp2p)
+
+To put the executor on a different machine, run it in libp2p mode and point the
+adapter at its peer address. The link is Noise-secured and identified by PeerID
+(== public key), with DCUtR hole-punching for NAT traversal.
+
+```sh
+# On the sandbox host: listen over libp2p; it prints its PeerID + multiaddrs.
+./bin/rcc-executor -libp2p /ip4/0.0.0.0/tcp/4001
+# -> serving on 12D3Koo... /ip4/.../tcp/4001/p2p/12D3Koo...
+
+# On the brain host: dial that peer instead of a unix socket.
+./bin/remote-cc-adapter \
+  --claude "$(command -v claude)" --resign \
+  --dylib ./native/macos/rcc_interpose.dylib \
+  --spawn-proxy ./bin/rcc-spawn-proxy \
+  --peer /ip4/<SANDBOX_IP>/tcp/4001/p2p/12D3Koo... \
+  --remote-prefix "$PWD" --workdir "$PWD" \
+  -- -p "read the files here"
+```
+
+Filesystem IO-RPC flows over libp2p today. Routing subprocesses (`Bash`, the
+ripgrep engine) across machines additionally needs the exec path bridged over
+libp2p — see [Status & roadmap](#status--roadmap).
+
 ## Routing
 
 Two policies (`internal/routing`):
@@ -165,6 +192,13 @@ locally — the adapter never routes a user's global config to the sandbox.
   filesystem in one pass instead of as a per-syscall fs-interpose metadata storm
   (design doc §4.1 pt5).
 
+- **Filesystem IO-RPC over go-libp2p** (`internal/transport`, tested): two
+  loopback libp2p hosts (Noise-secured, PeerID-addressed) carry the adapter ↔
+  executor fs-RPC; a remote-routed `stat`/`open`/`pread` is served on the peer
+  while local paths stay on the brain. `rcc-executor -libp2p` prints its PeerID +
+  multiaddrs; `remote-cc-adapter --peer <multiaddr>` dials it. DCUtR
+  hole-punching and circuit-relay fallback are enabled in the host config.
+
 **Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
 precedence first: rg-mode self-invocation under a remote cwd → local-binary
 allowlist → sentinel in argv → target under a remote prefix → working directory
@@ -175,16 +209,19 @@ children run with the injection environment stripped (no re-injection), and with
 
 **Next milestones:**
 
+- **Bridge the subprocess path over libp2p.** fs-RPC crosses machines, but the
+  spawn proxy still dials the executor over a local unix socket
+  (`RCC_EXECUTOR_SOCK`). For cross-machine `Bash`/ripgrep the adapter needs to
+  serve a local exec socket and splice each exec stream to the executor over the
+  shared libp2p connection (design doc §3.3).
+- **NAT-traversal field testing.** Hole-punching + relay options are enabled but
+  only loopback-tested; real cross-NAT verification needs two hosts and a relay.
 - **Natural routing of bare relative fs opens.** Files opened by absolute path
   (what claude's Read/Write tools do) route correctly; `open("rel")` /
   `openat(AT_FDCWD, "rel")` are left local because routing every relative open
   against the cwd destabilises claude's boot. Needs a safer cwd-scoped policy
   (design doc §4.3).
 
-- Wire the **go-libp2p** transport (DCUtR hole-punching + circuit-relay
-  fallback, Noise/TLS, PeerID == public key) so brain and sandbox can be on
-  different machines — currently a stub (`internal/transport/libp2p.go`, design
-  doc §3.3).
 - Linux **lazy slicing**: today the supervisor fetches whole routed files into a
   memfd because seccomp only traps `openat`; slicing needs trapping
   `read`/`lseek` too or a FUSE backing store (design doc §4.1.3, §4.3).

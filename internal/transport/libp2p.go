@@ -2,49 +2,173 @@ package transport
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/multiformats/go-multiaddr"
 )
 
-// ErrNotImplemented is returned by the libp2p transport stub. The go-libp2p
-// implementation (DCUtR hole-punching, circuit-relay fallback, Noise/TLS,
-// PeerID == public key) is the design target for crossing NATs between the
-// brain host and the remote sandbox; see design doc §3.3. It is intentionally
-// not yet wired so the first cut can be validated over a local Unix socket
-// without pulling in the libp2p dependency tree.
-var ErrNotImplemented = errors.New("transport: libp2p transport not yet implemented (design doc §3.3); use the unix-socket transport for local end-to-end runs")
+// RCCProtocol is the libp2p protocol ID for remote-cc-adapter streams. fs IO-RPC
+// and subprocess streams share it as separate streams on one connection (design
+// doc §3.3); the executor's stream-kind prefix byte still distinguishes them.
+const RCCProtocol protocol.ID = "/rcc/1.0.0"
 
-// Libp2pConfig holds the parameters a future go-libp2p transport will need.
-type Libp2pConfig struct {
-	// PeerAddr is the multiaddr (or PeerID) of the remote executor.
-	PeerAddr string
-	// RelayAddrs are optional circuit-relay multiaddrs used when hole-punching
-	// fails.
-	RelayAddrs []string
+// HostConfig configures a libp2p host.
+type HostConfig struct {
+	// ListenAddrs are multiaddrs to listen on, e.g. "/ip4/0.0.0.0/tcp/0".
+	ListenAddrs []string
+	// PrivKey is the host identity. If nil, a fresh Ed25519 key is generated
+	// (the PeerID is that key's hash — trust is pinned by exchanging PeerIDs).
+	PrivKey crypto.PrivKey
+	// EnableHolePunching turns on DCUtR direct-connection upgrade for NAT
+	// traversal; StaticRelays are circuit-relay v2 multiaddrs used as fallback.
+	EnableHolePunching bool
+	StaticRelays       []string
 }
 
-// Libp2pDialer is a placeholder Dialer. Every Dial returns ErrNotImplemented.
-type Libp2pDialer struct{ Config Libp2pConfig }
+// NewLibp2pHost builds a libp2p host with Noise/TLS security (PeerID == public
+// key). Defaults already include TCP+QUIC transports and yamux muxing.
+func NewLibp2pHost(cfg HostConfig) (host.Host, error) {
+	priv := cfg.PrivKey
+	if priv == nil {
+		var err error
+		priv, _, err = crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("transport: generate key: %w", err)
+		}
+	}
+	opts := []libp2p.Option{libp2p.Identity(priv)}
+	if len(cfg.ListenAddrs) > 0 {
+		opts = append(opts, libp2p.ListenAddrStrings(cfg.ListenAddrs...))
+	}
+	if cfg.EnableHolePunching {
+		opts = append(opts, libp2p.EnableHolePunching())
+	}
+	if relays := parseAddrInfos(cfg.StaticRelays); len(relays) > 0 {
+		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(relays))
+	}
+	return libp2p.New(opts...)
+}
 
-// NewLibp2pDialer constructs the stub dialer.
-func NewLibp2pDialer(cfg Libp2pConfig) *Libp2pDialer { return &Libp2pDialer{Config: cfg} }
+// parseAddrInfos best-effort parses p2p multiaddrs into peer.AddrInfo.
+func parseAddrInfos(addrs []string) []peer.AddrInfo {
+	var out []peer.AddrInfo
+	for _, a := range addrs {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		ma, err := multiaddr.NewMultiaddr(a)
+		if err != nil {
+			continue
+		}
+		if info, err := peer.AddrInfoFromP2pAddr(ma); err == nil {
+			out = append(out, *info)
+		}
+	}
+	return out
+}
 
-// Dial always returns ErrNotImplemented until go-libp2p is wired in.
-func (l *Libp2pDialer) Dial(context.Context) (Stream, error) { return nil, ErrNotImplemented }
+// Libp2pListener accepts inbound RCC streams on a host.
+type Libp2pListener struct {
+	h        host.Host
+	incoming chan network.Stream
+	closed   chan struct{}
+}
 
-// Close is a no-op.
-func (l *Libp2pDialer) Close() error { return nil }
+// ListenLibp2p registers the RCC stream handler on h and returns a Listener.
+func ListenLibp2p(h host.Host) *Libp2pListener {
+	l := &Libp2pListener{
+		h:        h,
+		incoming: make(chan network.Stream, 32),
+		closed:   make(chan struct{}),
+	}
+	h.SetStreamHandler(RCCProtocol, func(s network.Stream) {
+		select {
+		case l.incoming <- s:
+		case <-l.closed:
+			_ = s.Reset()
+		}
+	})
+	return l
+}
 
-// Libp2pListener is a placeholder Listener. Accept returns ErrNotImplemented.
-type Libp2pListener struct{ Config Libp2pConfig }
+// Accept returns the next inbound stream.
+func (l *Libp2pListener) Accept() (Stream, error) {
+	select {
+	case s := <-l.incoming:
+		return s, nil
+	case <-l.closed:
+		return nil, errors.New("transport: libp2p listener closed")
+	}
+}
 
-// NewLibp2pListener constructs the stub listener.
-func NewLibp2pListener(cfg Libp2pConfig) *Libp2pListener { return &Libp2pListener{Config: cfg} }
+// Addr returns the host's PeerID and its full p2p multiaddrs (what a dialer
+// connects to).
+func (l *Libp2pListener) Addr() string {
+	parts := []string{l.h.ID().String()}
+	suffix := "/p2p/" + l.h.ID().String()
+	for _, a := range l.h.Addrs() {
+		parts = append(parts, a.String()+suffix)
+	}
+	return strings.Join(parts, " ")
+}
 
-// Accept always returns ErrNotImplemented until go-libp2p is wired in.
-func (l *Libp2pListener) Accept() (Stream, error) { return nil, ErrNotImplemented }
+// Close stops accepting and closes the host.
+func (l *Libp2pListener) Close() error {
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+	}
+	l.h.RemoveStreamHandler(RCCProtocol)
+	return l.h.Close()
+}
 
-// Addr returns a descriptive placeholder address.
-func (l *Libp2pListener) Addr() string { return "libp2p:" + l.Config.PeerAddr + " (stub)" }
+// Libp2pDialer opens RCC streams to a peer over libp2p.
+type Libp2pDialer struct {
+	h    host.Host
+	peer peer.AddrInfo
+}
 
-// Close is a no-op.
-func (l *Libp2pListener) Close() error { return nil }
+// NewLibp2pDialer builds a dialer for peer info (PeerID + its multiaddrs).
+func NewLibp2pDialer(h host.Host, info peer.AddrInfo) *Libp2pDialer {
+	return &Libp2pDialer{h: h, peer: info}
+}
+
+// DialLibp2pPeer parses a "/ip4/.../tcp/.../p2p/<peerid>" multiaddr into a dialer.
+func DialLibp2pPeer(h host.Host, p2pAddr string) (*Libp2pDialer, error) {
+	ma, err := multiaddr.NewMultiaddr(strings.TrimSpace(p2pAddr))
+	if err != nil {
+		return nil, fmt.Errorf("transport: bad peer multiaddr: %w", err)
+	}
+	info, err := peer.AddrInfoFromP2pAddr(ma)
+	if err != nil {
+		return nil, fmt.Errorf("transport: bad peer addr info: %w", err)
+	}
+	return &Libp2pDialer{h: h, peer: *info}, nil
+}
+
+// Dial connects to the peer (if not already connected) and opens a new stream.
+func (d *Libp2pDialer) Dial(ctx context.Context) (Stream, error) {
+	if len(d.peer.Addrs) > 0 {
+		if err := d.h.Connect(ctx, d.peer); err != nil {
+			return nil, fmt.Errorf("transport: connect peer: %w", err)
+		}
+	}
+	s, err := d.h.NewStream(ctx, d.peer.ID, RCCProtocol)
+	if err != nil {
+		return nil, fmt.Errorf("transport: open stream: %w", err)
+	}
+	return s, nil
+}
+
+// Close closes the underlying host.
+func (d *Libp2pDialer) Close() error { return d.h.Close() }

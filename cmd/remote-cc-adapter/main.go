@@ -45,7 +45,8 @@ func main() {
 		dylibPath    = flag.String("dylib", "", "macOS interpose dylib path (required on macOS)")
 		supervisor   = flag.String("supervisor", "", "Linux seccomp supervisor path (required on Linux)")
 		spawnProxy   = flag.String("spawn-proxy", "", "path to rcc-spawn-proxy binary (required)")
-		executorSock = flag.String("executor-sock", "", "executor unix socket path (required)")
+		executorSock = flag.String("executor-sock", "", "executor unix socket path (co-located; required unless --peer)")
+		peerAddr     = flag.String("peer", "", "executor libp2p peer multiaddr, e.g. /ip4/HOST/tcp/PORT/p2p/PEERID (cross-machine transport)")
 		adapterSock  = flag.String("adapter-sock", defaultAdapterSock(), "fs IO-RPC socket the interceptor dials")
 		sentinel     = flag.String("spawn-sentinel", "RCC_REMOTE_MARK", "env marker that forces a subprocess remote")
 		localMode    = flag.Bool("default-remote", false, "route remote by default (local allowlist); otherwise local by default (remote allowlist)")
@@ -58,8 +59,11 @@ func main() {
 	flag.Var(&localPrefixes, "local-prefix", "path prefix kept local under -default-remote (repeatable)")
 	flag.Parse()
 
-	if *claudePath == "" || *spawnProxy == "" || *executorSock == "" {
-		log.Fatal("remote-cc-adapter: --claude, --spawn-proxy and --executor-sock are required")
+	if *claudePath == "" || *spawnProxy == "" {
+		log.Fatal("remote-cc-adapter: --claude and --spawn-proxy are required")
+	}
+	if (*executorSock == "") == (*peerAddr == "") {
+		log.Fatal("remote-cc-adapter: exactly one of --executor-sock or --peer is required")
 	}
 
 	logger := log.New(os.Stderr, "adapter ", log.LstdFlags|log.Lmsgprefix)
@@ -108,13 +112,33 @@ func main() {
 		return
 	}
 
+	// Build the executor-facing transport: unix socket (co-located) or libp2p.
+	var dialer transport.Dialer
+	if *peerAddr != "" {
+		h, err := transport.NewLibp2pHost(transport.HostConfig{
+			ListenAddrs:        []string{"/ip4/0.0.0.0/tcp/0"},
+			EnableHolePunching: true,
+		})
+		if err != nil {
+			log.Fatalf("remote-cc-adapter: libp2p host: %v", err)
+		}
+		d, err := transport.DialLibp2pPeer(h, *peerAddr)
+		if err != nil {
+			log.Fatalf("remote-cc-adapter: peer: %v", err)
+		}
+		dialer = d
+		logger.Printf("executor transport: libp2p peer %s", *peerAddr)
+	} else {
+		dialer = transport.NewUnixDialer(*executorSock)
+	}
+
 	// Start the interceptor-facing IO-RPC server.
 	ln, err := transport.ListenUnix(*adapterSock)
 	if err != nil {
 		log.Fatalf("remote-cc-adapter: listen %s: %v", *adapterSock, err)
 	}
 	defer ln.Close()
-	ad := adapter.New(ln, transport.NewUnixDialer(*executorSock), route, logger)
+	ad := adapter.New(ln, dialer, route, logger)
 	go func() {
 		if err := ad.Serve(); err != nil {
 			logger.Printf("io-rpc server stopped: %v", err)
