@@ -70,8 +70,22 @@ func TestFSServiceWriteAndReaddir(t *testing.T) {
 		t.Fatalf("readback: err=%v got=%q", err, got)
 	}
 
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	rd := fs.Handle(&protocol.Request{Op: protocol.OpReaddir, Path: dir})
-	if rd.Err != 0 || len(rd.Names) != 1 || rd.Names[0] != "out.txt" {
+	if rd.Err != 0 || len(rd.Names) != 2 {
 		t.Fatalf("readdir: err=%d names=%v", rd.Err, rd.Names)
+	}
+	// Directory entries must report DTDir so ripgrep recurses into them.
+	byName := map[string]uint8{}
+	for i, n := range rd.Names {
+		byName[n] = rd.Types[i]
+	}
+	if byName["out.txt"] != protocol.DTReg {
+		t.Errorf("out.txt type = %d, want DTReg", byName["out.txt"])
+	}
+	if byName["subdir"] != protocol.DTDir {
+		t.Errorf("subdir type = %d, want DTDir", byName["subdir"])
 	}
 }

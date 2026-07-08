@@ -194,7 +194,7 @@ static struct {
   int writable;      // buffering writes
   int isdir;         // directory listing
   unsigned char *wbuf; size_t wcap, wlen; // write buffer flushed on close
-  char **names; int ncount, npos;          // dir entries
+  char **names; unsigned char *dtypes; int ncount, npos; // dir entries + d_type
 } tab[MAXF];
 
 static int newslot(void) {
@@ -250,11 +250,16 @@ static int rpc_open(const char *path, int flags) {
     uint32_t n = cu32(&c);
     int i = newslot(); if (i < 0) { free(rb); errno = EMFILE; return -1; }
     tab[i].path = strdup(path); tab[i].isdir = 1;
-    tab[i].names = calloc(n ? n : 1, sizeof(char *)); tab[i].ncount = (int)n;
+    tab[i].names = calloc(n ? n : 1, sizeof(char *));
+    tab[i].dtypes = calloc(n ? n : 1, 1);
+    tab[i].ncount = (int)n;
     for (uint32_t k = 0; k < n && !c.err; k++) {
       uint32_t sl = cu32(&c);
+      if (c.off + sl > c.len) { c.err = 1; break; }
       char *nm = malloc(sl + 1); memcpy(nm, c.b + c.off, sl); nm[sl] = 0; c.off += sl;
       tab[i].names[k] = nm;
+      tab[i].dtypes[k] = (c.off < c.len) ? c.b[c.off] : 0; // per-entry d_type
+      c.off += 1;
     }
     free(rb);
     return tab[i].fd;
@@ -426,7 +431,7 @@ static int do_close(int fd, int useNc) {
     buf_t req = {0}; bu8(&req, OP_CLOSE); bu64(&req, tab[i].handle); size_t rl; free(rpc_call(&req, &rl)); free(req.b);
   }
   if (tab[i].writable) free(tab[i].wbuf);
-  if (tab[i].isdir) { for (int j = 0; j < tab[i].ncount; j++) free(tab[i].names[j]); free(tab[i].names); }
+  if (tab[i].isdir) { for (int j = 0; j < tab[i].ncount; j++) free(tab[i].names[j]); free(tab[i].names); free(tab[i].dtypes); }
   pthread_mutex_lock(&tab_mtx); free(tab[i].path); tab[i].fd = 0; pthread_mutex_unlock(&tab_mtx);
   return useNc ? close_nc(fd) : close(fd);
 }
@@ -449,7 +454,7 @@ int my_gde64(int fd, void *buf, size_t nbytes, long *basep) {
     *(unsigned long long *)(rec + 8) = tab[i].npos + 1;
     *(unsigned short *)(rec + 16) = (unsigned short)reclen;
     *(unsigned short *)(rec + 18) = (unsigned short)nl;
-    *(unsigned char *)(rec + 20) = DT_REG;
+    *(unsigned char *)(rec + 20) = tab[i].dtypes ? tab[i].dtypes[tab[i].npos] : DT_REG;
     memcpy(rec + 21, nm, nl); rec[21 + nl] = 0;
     used += reclen; tab[i].npos++;
   }
@@ -498,6 +503,15 @@ static int cwd_is_remote(void) {
 //   4. working directory under a remote prefix -> REMOTE (natural: a subprocess
 //      of a remote-routed project runs where the project lives)
 //   5. otherwise -> LOCAL
+//
+// NOTE: claude runs Grep/Glob by re-exec'ing ITSELF as its embedded ripgrep
+// engine (ripgrep flags like --no-config --files). That self-exec stays LOCAL
+// via the allowlist, but the child is injected too, so its recursive directory
+// walk is redirected op-by-op through the fs-interpose layer — correct (subdirs
+// now carry DTDir so it recurses) but a metadata storm. Routing that rg engine
+// wholesale to the executor to avoid the storm was attempted and deferred: run
+// natively there it loses its rg-mode context (the original argv[0]), so it
+// produced no results. That optimisation needs argv[0] preservation end-to-end.
 int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
                    const posix_spawnattr_t *at, char *const av[], char *const ev[]) {
   const char *proxy = getenv("RCC_SPAWN_PROXY");
