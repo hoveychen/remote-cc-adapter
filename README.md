@@ -156,21 +156,25 @@ locally — the adapter never routes a user's global config to the sandbox.
   (`security`, the claude binary) stay local via the interceptor's local-binary
   allowlist.
 
+- **Remote Grep/Glob, correct and via one remote ripgrep** (real claude): claude
+  runs Grep/Glob by re-exec'ing itself as its embedded ripgrep (it enters that
+  mode when `argv[0]`'s basename is `rg`). Recursive Glob over a routed project
+  finds nested files (dirent types carry `DTDir` so ripgrep recurses), and the
+  rg engine is routed to the executor as a single native subprocess with
+  `argv[0]` preserved — so its directory walk runs on the executor's real
+  filesystem in one pass instead of as a per-syscall fs-interpose metadata storm
+  (design doc §4.1 pt5).
+
 **Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
-precedence first: local-binary allowlist → sentinel in argv → target under a
-remote prefix → working directory under a remote prefix → local. This lets a
-subprocess of a remote-routed project run where the project lives while claude's
-own tooling stays local.
+precedence first: rg-mode self-invocation under a remote cwd → local-binary
+allowlist → sentinel in argv → target under a remote prefix → working directory
+under a remote prefix → local. This lets a subprocess of a remote-routed project
+run where the project lives while claude's own tooling stays local. Routed
+children run with the injection environment stripped (no re-injection), and with
+`argv[0]` preserved so argv[0]-sensitive binaries behave correctly.
 
 **Next milestones:**
 
-- **Route the ripgrep engine to the executor.** Grep/Glob are correct remotely
-  (the executor's READDIR reports real entry types, so ripgrep recurses), but
-  claude runs ripgrep by re-exec'ing *itself*, which stays local-but-injected
-  and walks the tree op-by-op through the fs-interpose layer — a metadata storm.
-  Routing that rg engine wholesale to the executor needs `argv[0]` preserved
-  end-to-end (run natively there it loses its rg-mode context and returns
-  nothing). Design doc §4.1 pt5.
 - **Natural routing of bare relative fs opens.** Files opened by absolute path
   (what claude's Read/Write tools do) route correctly; `open("rel")` /
   `openat(AT_FDCWD, "rel")` are left local because routing every relative open

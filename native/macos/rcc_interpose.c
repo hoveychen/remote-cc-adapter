@@ -497,21 +497,20 @@ static int cwd_is_remote(void) {
 // posix_spawn: decide whether the subprocess runs on the remote executor. It is
 // rewritten into an exec of the spawn proxy (which streams it remotely, design
 // doc §4.1 pt4) when it routes remote. Routing (highest precedence first):
-//   1. local-binary allowlist -> LOCAL (credentials/self-spawn must stay local)
-//   2. RCC_SPAWN_SENTINEL present in argv -> REMOTE (explicit opt-in / tests)
-//   3. target binary under a remote prefix -> REMOTE
-//   4. working directory under a remote prefix -> REMOTE (natural: a subprocess
+//   1. rg-mode self-invocation (claude re-exec'd as its embedded ripgrep, marked
+//      by a ripgrep flag like --no-config) with a remote cwd -> REMOTE, over the
+//      allowlist, so the recursive walk runs on the executor's real filesystem in
+//      one pass rather than as a per-syscall fs-interpose metadata storm.
+//   2. local-binary allowlist -> LOCAL (credentials/self-spawn must stay local)
+//   3. RCC_SPAWN_SENTINEL present in argv -> REMOTE (explicit opt-in / tests)
+//   4. target binary under a remote prefix -> REMOTE
+//   5. working directory under a remote prefix -> REMOTE (natural: a subprocess
 //      of a remote-routed project runs where the project lives)
-//   5. otherwise -> LOCAL
+//   6. otherwise -> LOCAL
 //
-// NOTE: claude runs Grep/Glob by re-exec'ing ITSELF as its embedded ripgrep
-// engine (ripgrep flags like --no-config --files). That self-exec stays LOCAL
-// via the allowlist, but the child is injected too, so its recursive directory
-// walk is redirected op-by-op through the fs-interpose layer — correct (subdirs
-// now carry DTDir so it recurses) but a metadata storm. Routing that rg engine
-// wholesale to the executor to avoid the storm was attempted and deferred: run
-// natively there it loses its rg-mode context (the original argv[0]), so it
-// produced no results. That optimisation needs argv[0] preservation end-to-end.
+// The proxy rewrite preserves the ORIGINAL argv[0]: claude enters ripgrep mode
+// only when argv[0]'s basename is "rg", so the executor must exec the binary
+// with that argv[0] intact (see cmd/rcc-spawn-proxy, internal/execproto).
 int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
                    const posix_spawnattr_t *at, char *const av[], char *const ev[]) {
   const char *proxy = getenv("RCC_SPAWN_PROXY");
@@ -519,28 +518,37 @@ int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_
   int n = 0;
   while (av && av[n]) n++;
 
+  // ripgrep-mode marker: --no-config is a ripgrep flag claude never uses in
+  // agent mode. Only route it remote when the walk targets a remote project.
+  int rgmode = 0;
+  for (int j = 1; j < n; j++)
+    if (strcmp(av[j], "--no-config") == 0) { rgmode = 1; break; }
+
   int route = 0;
   const char *reason = "default-local";
-  if (spawn_is_local_bin(path)) {
+  if (spawn_is_local_bin(path) && !(rgmode && cwd_is_remote())) {
     route = 0;
     reason = "local-allowlist";
   } else {
     int sent = 0;
     for (int j = 0; j < n; j++)
       if (sentinel && *sentinel && strstr(av[j], sentinel)) { sent = 1; break; }
-    if (sent) { route = 1; reason = "sentinel"; }
+    if (rgmode && cwd_is_remote()) { route = 1; reason = "rg-mode"; }
+    else if (sent) { route = 1; reason = "sentinel"; }
     else if (is_remote(path)) { route = 1; reason = "target-prefix"; }
     else if (cwd_is_remote()) { route = 1; reason = "cwd-prefix"; }
   }
-  lg("SPAWN\ttarget=%s\troute=%d\treason=%s\targ1=%s\targ2=%s\n", path ? path : "?",
-     route, reason, (n > 1 && av[1]) ? av[1] : "", (n > 2 && av[2]) ? av[2] : "");
+  lg("SPAWN\ttarget=%s\troute=%d\treason=%s\targ0=%s\targ1=%s\n", path ? path : "?",
+     route, reason, (n > 0 && av[0]) ? av[0] : "", (n > 1 && av[1]) ? av[1] : "");
 
   if (route && proxy && *proxy) {
-    char **na = calloc(n + 2, sizeof(char *));
+    // proxy argv: [proxy, exec-path, argv0, argv1, ...] — exec-path is the real
+    // binary; the rest is the child's full argv with argv[0] preserved.
+    char **na = calloc(n + 3, sizeof(char *));
     int k = 0;
     na[k++] = (char *)proxy;
-    na[k++] = (char *)path; // original target as argv[1]
-    for (int j = 1; j < n; j++) na[k++] = av[j];
+    na[k++] = (char *)path;
+    for (int j = 0; j < n; j++) na[k++] = av[j];
     na[k] = NULL;
     int r = posix_spawn(pid, proxy, fa, at, na, ev);
     free(na);

@@ -32,9 +32,18 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 		_ = execproto.WriteExit(stream, 127)
 		return
 	}
-	e.logf("[exec] spawn argv=%v cwd=%s", req.Argv, req.Cwd)
+	e.logf("[exec] spawn path=%s argv=%v cwd=%s", req.Path, req.Argv, req.Cwd)
 
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
+	// Preserve argv[0]: run req.Path (the binary) with the full req.Argv as the
+	// argument vector, so argv[0] reaches the child verbatim (claude enters
+	// ripgrep mode only when argv[0]'s basename is "rg"). Fall back to Argv[0] as
+	// the path when Path is unset (older proxy).
+	binPath := req.Path
+	if binPath == "" {
+		binPath = req.Argv[0]
+	}
+	cmd := exec.Command(binPath)
+	cmd.Args = req.Argv
 	cmd.Dir = req.Cwd
 	base := req.Env
 	if len(base) == 0 {

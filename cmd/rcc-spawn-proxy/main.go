@@ -8,9 +8,13 @@
 //
 // Invocation (by the interceptor):
 //
-//	rcc-spawn-proxy <target-binary> [args...]
+//	rcc-spawn-proxy <exec-path> <argv0> [argv1...]
 //
-// The executor socket is read from RCC_EXECUTOR_SOCK.
+// <exec-path> is the binary to run on the executor; the remaining arguments are
+// the child's full argument vector including argv[0], which is preserved so
+// binaries that switch behaviour on argv[0] (claude's embedded ripgrep keys off
+// argv[0] basename "rg") work when routed. The executor socket is read from
+// RCC_EXECUTOR_SOCK.
 package main
 
 import (
@@ -32,8 +36,8 @@ func main() {
 }
 
 func run() int {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "rcc-spawn-proxy: usage: rcc-spawn-proxy <target> [args...]")
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "rcc-spawn-proxy: usage: rcc-spawn-proxy <exec-path> <argv0> [argv1...]")
 		return 127
 	}
 	sock := os.Getenv("RCC_EXECUTOR_SOCK")
@@ -55,7 +59,7 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "rcc-spawn-proxy: write kind: %v\n", err)
 		return 127
 	}
-	req := &execproto.SpawnRequest{Argv: os.Args[1:], Cwd: cwd, Env: os.Environ()}
+	req := &execproto.SpawnRequest{Path: os.Args[1], Argv: os.Args[2:], Cwd: cwd, Env: os.Environ()}
 	if err := execproto.WriteSpawnRequest(stream, req); err != nil {
 		fmt.Fprintf(os.Stderr, "rcc-spawn-proxy: send request: %v\n", err)
 		return 127

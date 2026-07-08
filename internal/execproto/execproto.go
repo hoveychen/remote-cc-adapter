@@ -33,7 +33,14 @@ const (
 const MaxChunk = 1 << 20 // 1 MiB
 
 // SpawnRequest describes a subprocess the executor should run on its host.
+//
+// Path is the binary to execute. Argv is the full argument vector INCLUDING
+// argv[0], preserved separately from Path because some binaries pick their mode
+// from argv[0] — claude runs its embedded ripgrep only when argv[0]'s basename
+// is "rg". If Path is empty, the executor falls back to Argv[0] as the binary
+// path (older proxy behaviour).
 type SpawnRequest struct {
+	Path string   `json:"path,omitempty"`
 	Argv []string `json:"argv"`
 	Cwd  string   `json:"cwd"`
 	Env  []string `json:"env,omitempty"`
