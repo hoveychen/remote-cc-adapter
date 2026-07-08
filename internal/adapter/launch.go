@@ -19,6 +19,7 @@ const (
 	EnvSpawnProxy    = "RCC_SPAWN_PROXY"     // path to the rcc-spawn-proxy binary
 	EnvRemotePrefix  = "RCC_REMOTE_PREFIXES" // ':'-joined remote-routed path prefixes
 	EnvSpawnSentinel = "RCC_SPAWN_SENTINEL"  // marker that forces a subprocess remote
+	EnvClaudePath    = "RCC_CLAUDE_PATH"     // claude binary path; kept local when re-spawned
 	EnvDylib         = "DYLD_INSERT_LIBRARIES"
 )
 
@@ -30,6 +31,9 @@ type LaunchConfig struct {
 	ClaudePath string
 	// Args are the arguments passed to claude.
 	Args []string
+	// WorkDir sets claude's working directory. Point it under a remote prefix to
+	// exercise natural cwd-based subprocess routing. Empty inherits the adapter's.
+	WorkDir string
 
 	AdapterSock    string
 	ExecutorSock   string
@@ -58,6 +62,7 @@ func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
 		EnvSpawnProxy+"="+c.SpawnProxyPath,
 		EnvRemotePrefix+"="+strings.Join(c.RemotePrefixes, ":"),
 		EnvSpawnSentinel+"="+c.SpawnSentinel,
+		EnvClaudePath+"="+c.ClaudePath,
 	)
 	env = append(env, c.ExtraEnv...)
 
@@ -80,6 +85,7 @@ func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
 		return nil, fmt.Errorf("adapter: unsupported platform %q", runtime.GOOS)
 	}
 	cmd.Env = env
+	cmd.Dir = c.WorkDir
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

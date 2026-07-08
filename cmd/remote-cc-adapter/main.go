@@ -51,6 +51,7 @@ func main() {
 		localMode    = flag.Bool("default-remote", false, "route remote by default (local allowlist); otherwise local by default (remote allowlist)")
 		resign       = flag.Bool("resign", false, "on macOS, copy+ad-hoc-resign claude so the dylib can load, and run the copy")
 		printCmd     = flag.Bool("print-cmd", false, "print the claude launch command and exit (no spawn)")
+		workDir      = flag.String("workdir", "", "claude working directory (point under a remote prefix for natural cwd routing)")
 	)
 	var remotePrefixes, localPrefixes stringList
 	flag.Var(&remotePrefixes, "remote-prefix", "path prefix routed to the remote executor (repeatable)")
@@ -67,7 +68,9 @@ func main() {
 	if *localMode {
 		mode = routing.ModeLocalAllowlist
 	}
-	route := routing.New(mode, remotePrefixes, localPrefixes)
+	// Resolve symlinks in prefixes (e.g. macOS /tmp -> /private/tmp) so they
+	// match the canonical paths claude actually opens after cwd resolution.
+	route := routing.New(mode, resolvePrefixes(remotePrefixes), resolvePrefixes(localPrefixes))
 
 	claudeToRun := *claudePath
 	if runtime.GOOS == "darwin" && *resign {
@@ -83,6 +86,7 @@ func main() {
 	cfg := &adapter.LaunchConfig{
 		ClaudePath:     claudeToRun,
 		Args:           flag.Args(),
+		WorkDir:        *workDir,
 		AdapterSock:    *adapterSock,
 		ExecutorSock:   *executorSock,
 		SpawnProxyPath: *spawnProxy,
@@ -136,6 +140,20 @@ func main() {
 
 func defaultAdapterSock() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("rcc-adapter-%d.sock", os.Getpid()))
+}
+
+// resolvePrefixes resolves symlinks in each prefix (best effort). A prefix that
+// cannot be resolved (e.g. does not exist yet) is passed through unchanged.
+func resolvePrefixes(in []string) []string {
+	out := make([]string, len(in))
+	for i, p := range in {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			out[i] = r
+		} else {
+			out[i] = p
+		}
+	}
+	return out
 }
 
 func injectedEnv(cfg *adapter.LaunchConfig) []string {

@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dirent.h>
@@ -56,6 +57,29 @@ extern int gde64(int, void *, size_t, long *) __asm("___getdirentries64");
 // ---- protocol opcodes (mirror internal/protocol/protocol.go) --------------
 
 enum { OP_STAT = 1, OP_OPEN = 2, OP_PREAD = 3, OP_WRITEFILE = 4, OP_CLOSE = 5, OP_READDIR = 6 };
+
+// ---- audit log (opt-in via RCC_LOG=<path>) --------------------------------
+
+static int LOGFD = -2; // -2 = unchecked, -1 = disabled
+static pthread_mutex_t log_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void lg(const char *fmt, ...) {
+  if (LOGFD == -1) return;
+  if (LOGFD == -2) {
+    const char *p = getenv("RCC_LOG");
+    LOGFD = (p && *p) ? open(p, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
+    if (LOGFD < 0) { LOGFD = -1; return; }
+  }
+  char b[1024];
+  va_list a;
+  va_start(a, fmt);
+  int n = vsnprintf(b, sizeof b, fmt, a);
+  va_end(a);
+  if (n > 0) {
+    pthread_mutex_lock(&log_mtx);
+    write(LOGFD, b, n);
+    pthread_mutex_unlock(&log_mtx);
+  }
+}
 
 // ---- RPC client (single serialized connection to the adapter) -------------
 
@@ -210,6 +234,7 @@ static int rpc_stat(const char *path, struct stat *s) {
 // remote open: registers a virtual fd. Returns fd, -1 (errno), or -2 (not routed).
 static int rpc_open(const char *path, int flags) {
   if (!is_remote(path)) return -2;
+  lg("OPEN\t%s\tflags=0x%x\n", path, flags);
   int wr = (flags & (O_WRONLY | O_RDWR)) || (flags & O_CREAT);
 
   // Probe with stat first to learn dir/size and existence.
@@ -313,10 +338,43 @@ int my_fstat(int fd, struct stat *s) {
 }
 
 static int doopen(const char *p, int f) { return rpc_open(p, f); }
+
+// resolve_at joins a relative openat() path against a virtual directory fd so
+// that openat(dirfd, "note.txt") on a routed dir resolves to the routed file.
+// Returns a malloc'd absolute path (caller frees), or NULL to use p as-is.
+//
+// Note: this deliberately does NOT resolve openat(AT_FDCWD, "rel") or plain
+// open("rel") against getcwd(). Routing every relative open against the cwd
+// destabilises claude's own boot (it opens many relative paths that must stay
+// local), and in practice claude's Read/Write tools resolve paths to absolute
+// before opening, so routing sees them anyway. Natural routing of bare relative
+// opens is left as future work (design doc §4.3).
+static char *resolve_at(int d, const char *p) {
+  if (!p || p[0] == '/') return NULL; // absolute or null: no join needed
+  int i = slot(d);
+  if (i < 0 || !tab[i].path) return NULL; // dirfd is not one of ours
+  char *full = malloc(strlen(tab[i].path) + 1 + strlen(p) + 1);
+  sprintf(full, "%s/%s", tab[i].path, p);
+  return full;
+}
+
 int my_open(const char *p, int f, ...) { int r = doopen(p, f); if (r != -2) return r; mode_t m = 0; if (f & O_CREAT) { va_list a; va_start(a, f); m = va_arg(a, int); va_end(a); } return open(p, f, m); }
 int my_open_nc(const char *p, int f, ...) { int r = doopen(p, f); if (r != -2) return r; mode_t m = 0; if (f & O_CREAT) { va_list a; va_start(a, f); m = va_arg(a, int); va_end(a); } return open_nc(p, f, m); }
-int my_openat(int d, const char *p, int f, ...) { int r = doopen(p, f); if (r != -2) return r; mode_t m = 0; if (f & O_CREAT) { va_list a; va_start(a, f); m = va_arg(a, int); va_end(a); } return openat(d, p, f, m); }
-int my_openat_nc(int d, const char *p, int f, ...) { int r = doopen(p, f); if (r != -2) return r; mode_t m = 0; if (f & O_CREAT) { va_list a; va_start(a, f); m = va_arg(a, int); va_end(a); } return openat_nc(d, p, f, m); }
+int my_openat(int d, const char *p, int f, ...) { char *j = resolve_at(d, p); int r = doopen(j ? j : p, f); free(j); if (r != -2) return r; mode_t m = 0; if (f & O_CREAT) { va_list a; va_start(a, f); m = va_arg(a, int); va_end(a); } return openat(d, p, f, m); }
+int my_openat_nc(int d, const char *p, int f, ...) { char *j = resolve_at(d, p); int r = doopen(j ? j : p, f); free(j); if (r != -2) return r; mode_t m = 0; if (f & O_CREAT) { va_list a; va_start(a, f); m = va_arg(a, int); va_end(a); } return openat_nc(d, p, f, m); }
+
+// fcntl: virtual fds are placeholder /dev/null descriptors, so F_GETPATH would
+// leak "/dev/null" (design doc §4.3). Return the routed path instead; other
+// commands pass through.
+int my_fcntl(int fd, int cmd, ...) {
+  va_list a; va_start(a, cmd); void *arg = va_arg(a, void *); va_end(a);
+  int i = slot(fd);
+  if (i >= 0 && cmd == F_GETPATH && tab[i].path && arg) {
+    strlcpy((char *)arg, tab[i].path, MAXPATHLEN);
+    return 0;
+  }
+  return fcntl(fd, cmd, arg);
+}
 
 ssize_t my_read(int fd, void *b, size_t n) {
   int i = slot(fd);
@@ -401,18 +459,69 @@ int my_gde64(int fd, void *buf, size_t nbytes, long *basep) {
 
 // ---- subprocess forwarding -------------------------------------------------
 
-// posix_spawn: rewrite spawns that hit the sentinel into an exec of the spawn
-// proxy, which streams the process on the remote executor (design doc §4.1 pt4).
+// Binaries that must always run locally even when the working directory routes
+// remote: keychain access (credentials live on the brain host), the spawn proxy
+// itself (avoid an infinite loop), and claude re-spawning itself (subagents run
+// in-process; a spawned claude helper still needs the brain-local adapter
+// socket + credentials). Extend via RCC_LOCAL_BINS (':'-joined substrings).
+static int spawn_is_local_bin(const char *path) {
+  if (!path) return 0;
+  static const char *defaults[] = {"/usr/bin/security", "rcc-spawn-proxy", NULL};
+  for (int i = 0; defaults[i]; i++)
+    if (strstr(path, defaults[i])) return 1;
+  const char *claude = getenv("RCC_CLAUDE_PATH");
+  if (claude && *claude && strstr(path, claude)) return 1;
+  const char *bins = getenv("RCC_LOCAL_BINS");
+  if (bins && *bins) {
+    char *dup = strdup(bins);
+    int hit = 0;
+    for (char *t = strtok(dup, ":"); t && !hit; t = strtok(NULL, ":"))
+      if (*t && strstr(path, t)) hit = 1;
+    free(dup);
+    if (hit) return 1;
+  }
+  return 0;
+}
+
+static int cwd_is_remote(void) {
+  char cwd[4096];
+  if (getcwd(cwd, sizeof cwd)) return is_remote(cwd);
+  return 0;
+}
+
+// posix_spawn: decide whether the subprocess runs on the remote executor. It is
+// rewritten into an exec of the spawn proxy (which streams it remotely, design
+// doc §4.1 pt4) when it routes remote. Routing (highest precedence first):
+//   1. local-binary allowlist -> LOCAL (credentials/self-spawn must stay local)
+//   2. RCC_SPAWN_SENTINEL present in argv -> REMOTE (explicit opt-in / tests)
+//   3. target binary under a remote prefix -> REMOTE
+//   4. working directory under a remote prefix -> REMOTE (natural: a subprocess
+//      of a remote-routed project runs where the project lives)
+//   5. otherwise -> LOCAL
 int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
                    const posix_spawnattr_t *at, char *const av[], char *const ev[]) {
   const char *proxy = getenv("RCC_SPAWN_PROXY");
   const char *sentinel = getenv("RCC_SPAWN_SENTINEL");
-  int hit = 0, n = 0;
-  while (av && av[n]) { if (sentinel && *sentinel && strstr(av[n], sentinel)) hit = 1; n++; }
-  // Also route when the target binary lives under a remote prefix.
-  if (!hit && is_remote(path)) hit = 1;
+  int n = 0;
+  while (av && av[n]) n++;
 
-  if (hit && proxy && *proxy && !(path && strstr(path, "rcc-spawn-proxy"))) {
+  int route = 0;
+  const char *reason = "default-local";
+  if (spawn_is_local_bin(path)) {
+    route = 0;
+    reason = "local-allowlist";
+  } else {
+    int sent = 0;
+    for (int j = 0; j < n; j++)
+      if (sentinel && *sentinel && strstr(av[j], sentinel)) { sent = 1; break; }
+    if (sent) { route = 1; reason = "sentinel"; }
+    else if (is_remote(path)) { route = 1; reason = "target-prefix"; }
+    else if (cwd_is_remote()) { route = 1; reason = "cwd-prefix"; }
+  }
+  lg("SPAWN\ttarget=%s\troute=%d\treason=%s\targ1=%s\targ2=%s\n", path ? path : "?",
+     route, reason, (n > 1 && av[1]) ? av[1] : "", (n > 2 && av[2]) ? av[2] : "");
+
+  if (route && proxy && *proxy) {
     char **na = calloc(n + 2, sizeof(char *));
     int k = 0;
     na[k++] = (char *)proxy;
@@ -433,4 +542,5 @@ DI(my_open, open) DI(my_open_nc, open_nc) DI(my_openat, openat) DI(my_openat_nc,
 DI(my_read, read) DI(my_read_nc, read_nc) DI(my_pread, pread) DI(my_pread_nc, pread_nc)
 DI(my_write, write) DI(my_write_nc, write_nc) DI(my_pwrite, pwrite)
 DI(my_lseek, lseek) DI(my_close, close) DI(my_close_nc, close_nc) DI(my_gde64, gde64)
+DI(my_fcntl, fcntl)
 DI(my_posix_spawn, posix_spawn)

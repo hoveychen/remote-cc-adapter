@@ -147,13 +147,28 @@ locally — the adapter never routes a user's global config to the sandbox.
   (`internal/executor` exec test).
 - Both native interceptors compile clean (macOS dylib, Linux seccomp), verified
   on macOS and in a Linux container.
+- **Real `claude` injection, end-to-end on macOS** (`scripts/e2e-local.sh`): a
+  re-signed claude with the dylib injected has both Read and Bash redirected to
+  the executor. Read of a routed file shows OPEN+PREAD in the executor log and
+  returns the file's content; Bash run with claude's cwd under the remote prefix
+  executes on the executor (observable via the `RCC_EXECUTOR=1` marker) — routed
+  **naturally by cwd, no sentinel**. claude's own credential/self spawns
+  (`security`, the claude binary) stay local via the interceptor's local-binary
+  allowlist.
 
-**Ported from the POC, not yet re-verified end-to-end here:**
-
-- Native interceptor ↔ **real** `claude` injection (needs an installed `claude`
-  and codesign; validated in the POC per design doc §4.1.1, not re-run in CI).
+**Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
+precedence first: local-binary allowlist → sentinel in argv → target under a
+remote prefix → working directory under a remote prefix → local. This lets a
+subprocess of a remote-routed project run where the project lives while claude's
+own tooling stays local.
 
 **Next milestones:**
+
+- **Natural routing of bare relative fs opens.** Files opened by absolute path
+  (what claude's Read/Write tools do) route correctly; `open("rel")` /
+  `openat(AT_FDCWD, "rel")` are left local because routing every relative open
+  against the cwd destabilises claude's boot. Needs a safer cwd-scoped policy
+  (design doc §4.3).
 
 - Wire the **go-libp2p** transport (DCUtR hole-punching + circuit-relay
   fallback, Noise/TLS, PeerID == public key) so brain and sandbox can be on

@@ -11,8 +11,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CLAUDE="${CLAUDE:-$(command -v claude)}"
 MODEL="${RCC_E2E_MODEL:-haiku}"
-# Short dir so Unix socket paths fit the ~104-char sun_path limit.
-WORK="$(mktemp -d /tmp/rccE2E.XXXX)"
+# Short dir so Unix socket paths fit the ~104-char sun_path limit. Resolve
+# symlinks (macOS /tmp -> /private/tmp) so the routed paths claude opens match
+# the canonical prefix the adapter uses.
+WORK="$(cd "$(mktemp -d /tmp/rccE2E.XXXX)" && pwd -P)"
 VFS="$WORK/vfs"
 EXEC_SOCK="$WORK/exec.sock"
 ADAPTER_SOCK="$WORK/adapter.sock"
@@ -40,6 +42,11 @@ echo "== start executor =="
 EXEC_PID=$!
 for _ in $(seq 1 50); do [[ -S "$EXEC_SOCK" ]] && break; sleep 0.1; done
 
+# Natural routing: claude runs with its working directory UNDER the remote
+# prefix (--workdir "$VFS"). Files it reads and subprocesses it spawns then route
+# remote by path/cwd automatically — no sentinel. claude's own credential/self
+# spawns (security, the claude binary) stay local via the interceptor's
+# local-binary allowlist, so auth still works.
 run_claude() {
   local prompt="$1"
   "$REPO/bin/remote-cc-adapter" \
@@ -50,6 +57,7 @@ run_claude() {
     --executor-sock "$EXEC_SOCK" \
     --adapter-sock "$ADAPTER_SOCK" \
     --remote-prefix "$VFS" \
+    --workdir "$VFS" \
     -- --model "$MODEL" --allowedTools Read Bash -p "$prompt"
 }
 
@@ -57,20 +65,16 @@ echo "== TEST 1: Read a routed file =="
 OUT1="$(run_claude "Read the file $ROUTED_FILE and reply with ONLY the value after 'marker:'." 2>/dev/null || true)"
 echo "claude said: $OUT1"
 
-# The dylib's current opt-in trigger for routing a subprocess remote is the
-# RCC_REMOTE_SENTINEL marker appearing in the command (design doc §4.1.1). We
-# put it in the command so it routes; claude's own startup spawns (security for
-# keychain, git status, ...) do NOT contain it and stay local, so auth works
-# normally. A natural routing policy (by cwd, with a local-binary allowlist) is
-# future work.
-echo "== TEST 2: Bash on the executor =="
-OUT2="$(run_claude "Run this exact bash command and reply with ONLY its output: echo RCC_REMOTE_MARK; echo REMOTE=\$RCC_EXECUTOR" 2>/dev/null || true)"
+echo "== TEST 2: Bash on the executor (natural cwd routing, no sentinel) =="
+OUT2="$(run_claude "Run this exact bash command and reply with ONLY its output: echo REMOTE=\$RCC_EXECUTOR" 2>/dev/null || true)"
 echo "claude said: $OUT2"
 
 echo
 echo "===== VERDICT ====="
 PASS=1
-if grep -q "OPEN $ROUTED_FILE" "$EXEC_LOG" && grep -q "PREAD" "$EXEC_LOG"; then
+# Match on the basename: paths in the log are symlink-canonical (e.g. macOS
+# /tmp -> /private/tmp), so an exact $ROUTED_FILE match would spuriously miss.
+if grep -qE "OPEN .*/$(basename "$ROUTED_FILE")" "$EXEC_LOG" && grep -q "PREAD" "$EXEC_LOG"; then
   echo "[PASS] Read routed through executor RPC (OPEN+PREAD in executor log)"
 else
   echo "[FAIL] no executor RPC evidence for the routed Read"; PASS=0
