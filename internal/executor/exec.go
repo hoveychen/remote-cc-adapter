@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -35,13 +36,16 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = req.Cwd
-	// Mark the child as running in the remote executor context so downstream
-	// tooling (and the e2e tests) can detect remote execution.
 	base := req.Env
 	if len(base) == 0 {
 		base = os.Environ()
 	}
-	cmd.Env = append(append([]string(nil), base...), "RCC_EXECUTOR=1")
+	// The child runs natively on the executor, so strip the brain-side
+	// interception environment: DYLD_INSERT_LIBRARIES (the macOS interpose dylib)
+	// and the RCC_* wiring. Otherwise a routed subprocess would re-inject itself
+	// and forward its own filesystem ops back to the adapter — a re-injection
+	// loop / metadata storm. Then mark it as running remotely.
+	cmd.Env = append(scrubInjectionEnv(base), "RCC_EXECUTOR=1")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -93,6 +97,20 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 	_ = execproto.WriteExit(stream, int32(code))
 	wmu.Unlock()
 	e.logf("[exec] exit code=%d", code)
+}
+
+// scrubInjectionEnv drops the brain-side interception variables from a child's
+// environment: DYLD_INSERT_LIBRARIES and everything RCC_* (RCC_EXECUTOR is
+// re-added by the caller).
+func scrubInjectionEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "DYLD_INSERT_LIBRARIES=") || strings.HasPrefix(kv, "RCC_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 func pump(r io.Reader, tag byte, write func(byte, []byte), wg *sync.WaitGroup) {

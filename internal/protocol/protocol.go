@@ -85,7 +85,19 @@ type Response struct {
 	Handle uint64   // OpOpen: opaque handle
 	Data   []byte   // OpPread: bytes read
 	Names  []string // OpReaddir: entry names
+	Types  []uint8  // OpReaddir: per-entry POSIX d_type (parallel to Names)
 }
+
+// POSIX d_type values carried per entry in a READDIR response (BSD/Linux
+// dirent.h). Directory type is load-bearing: the native interceptor synthesises
+// dirents for the intercepted process, and tools like ripgrep use d_type to
+// decide whether to recurse — a directory mislabelled DTReg is never descended.
+const (
+	DTUnknown uint8 = 0
+	DTDir     uint8 = 4
+	DTReg     uint8 = 8
+	DTLnk     uint8 = 10
+)
 
 // IsDir reports whether Mode denotes a directory (S_IFDIR == 0040000).
 func (r *Response) IsDir() bool { return r.Mode&0o170000 == 0o040000 }
@@ -268,8 +280,13 @@ func WriteResponse(w io.Writer, op Op, resp *Response) error {
 			e.bytes(resp.Data)
 		case OpReaddir:
 			e.u32(uint32(len(resp.Names)))
-			for _, n := range resp.Names {
+			for i, n := range resp.Names {
 				e.str(n)
+				var t uint8
+				if i < len(resp.Types) {
+					t = resp.Types[i]
+				}
+				e.u8(t)
 			}
 		case OpWriteFile, OpClose:
 			// errno only
@@ -299,8 +316,10 @@ func ReadResponse(r io.Reader, op Op) (*Response, error) {
 		case OpReaddir:
 			n := p.u32()
 			resp.Names = make([]string, 0, n)
+			resp.Types = make([]uint8, 0, n)
 			for i := uint32(0); i < n && p.err == nil; i++ {
 				resp.Names = append(resp.Names, p.str())
+				resp.Types = append(resp.Types, p.u8())
 			}
 		case OpWriteFile, OpClose:
 		}

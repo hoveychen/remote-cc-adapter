@@ -164,6 +164,13 @@ own tooling stays local.
 
 **Next milestones:**
 
+- **Route the ripgrep engine to the executor.** Grep/Glob are correct remotely
+  (the executor's READDIR reports real entry types, so ripgrep recurses), but
+  claude runs ripgrep by re-exec'ing *itself*, which stays local-but-injected
+  and walks the tree op-by-op through the fs-interpose layer — a metadata storm.
+  Routing that rg engine wholesale to the executor needs `argv[0]` preserved
+  end-to-end (run natively there it loses its rg-mode context and returns
+  nothing). Design doc §4.1 pt5.
 - **Natural routing of bare relative fs opens.** Files opened by absolute path
   (what claude's Read/Write tools do) route correctly; `open("rel")` /
   `openat(AT_FDCWD, "rel")` are left local because routing every relative open

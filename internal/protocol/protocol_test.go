@@ -42,7 +42,7 @@ func TestResponseRoundTrip(t *testing.T) {
 		{OpStat, &Response{Mode: 0o100644, Size: 12345}},
 		{OpOpen, &Response{Mode: 0o40755, Size: 0, Handle: 99}},
 		{OpPread, &Response{Data: []byte("abcdef")}},
-		{OpReaddir, &Response{Names: []string{"a.txt", "b.txt", "sub"}}},
+		{OpReaddir, &Response{Names: []string{"a.txt", "b.txt", "sub"}, Types: []uint8{DTReg, DTReg, DTDir}}},
 		{OpWriteFile, &Response{}},
 		{OpClose, &Response{}},
 		{OpStat, &Response{Err: -2}}, // ENOENT: no payload beyond errno
@@ -62,6 +62,11 @@ func TestResponseRoundTrip(t *testing.T) {
 		}
 		if len(got.Names) != len(c.resp.Names) {
 			t.Errorf("%s: names len %d != %d", c.op, len(got.Names), len(c.resp.Names))
+		}
+		for i := range c.resp.Types {
+			if i < len(got.Types) && got.Types[i] != c.resp.Types[i] {
+				t.Errorf("%s: type[%d]=%d want %d", c.op, i, got.Types[i], c.resp.Types[i])
+			}
 		}
 		if buf.Len() != 0 {
 			t.Errorf("%s: %d trailing bytes", c.op, buf.Len())

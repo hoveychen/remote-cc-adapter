@@ -122,11 +122,29 @@ func (s *FSService) readdir(req *protocol.Request) *protocol.Response {
 		return &protocol.Response{Err: toErrno(err)}
 	}
 	names := make([]string, len(ents))
+	types := make([]uint8, len(ents))
 	for i, e := range ents {
 		names[i] = e.Name()
+		types[i] = direntType(e)
 	}
 	s.logf("READDIR %s -> %d entries", req.Path, len(names))
-	return &protocol.Response{Names: names}
+	return &protocol.Response{Names: names, Types: types}
+}
+
+// direntType maps a directory entry to its POSIX d_type. Directory type must be
+// accurate: the interceptor forwards it to tools (ripgrep) that use it to decide
+// whether to recurse.
+func direntType(e os.DirEntry) uint8 {
+	switch {
+	case e.IsDir():
+		return protocol.DTDir
+	case e.Type()&os.ModeSymlink != 0:
+		return protocol.DTLnk
+	case e.Type().IsRegular():
+		return protocol.DTReg
+	default:
+		return protocol.DTUnknown
+	}
 }
 
 // CloseAll releases any handles left open when a stream ends.
