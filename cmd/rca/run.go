@@ -382,6 +382,17 @@ func cmdRun(args []string) int {
 		return 0
 	}
 
+	// On Linux the seccomp supervisor redirects routed opens to a rcc-fuse
+	// mount; auto-orchestrate it so `rca <command>` is a single command (macOS
+	// uses DYLD interposition and needs none). No-op if --fuse-mount was given.
+	fuseMnt, fuseCleanup, err := ensureFuseMount(o.fuseMnt, o.adapterSock, logger)
+	if err != nil {
+		logger.Printf("fuse mount: %v", err)
+		return 1
+	}
+	defer fuseCleanup()
+	o.fuseMnt = fuseMnt
+
 	// Build and spawn the intercepted target process.
 	cfg := &adapter.LaunchConfig{
 		ClaudePath:     target,

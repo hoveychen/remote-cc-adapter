@@ -78,7 +78,9 @@ after a literal -- is passed to <command> verbatim):
 Advanced run-mode flags: --adapter-sock, --spawn-sentinel, --dylib,
 --supervisor, --spawn-proxy, --fuse-mount.
 
-Serve flags: --listen, --sock, --hole-punch, --relays.
+Serve flags: --listen, --sock, --hole-punch, --relays, --announce
+(env RCA_SERVE_ANNOUNCE; advertise a public addr for direct dial behind
+1:1 NAT with an opened port).
 Relay flags: --listen (default /ip4/0.0.0.0/tcp/8080/ws), --announce
 (env RCA_RELAY_ANNOUNCE); identity via env RCA_RELAY_KEY.
 `)

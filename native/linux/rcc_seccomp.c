@@ -41,6 +41,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -151,6 +152,12 @@ static int open_fuse(const char *path) {
 
 // ---- supervisor loop -------------------------------------------------------
 
+// SIGCHLD handler: empty on purpose. Its only job is to interrupt the blocking
+// SECCOMP_IOCTL_NOTIF_RECV (installed without SA_RESTART) when the target exits,
+// so the loop can notice and terminate instead of blocking forever — the
+// target's exit_group is not trapped, so nothing else wakes the ioctl.
+static void on_sigchld(int sig) { (void)sig; }
+
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: rcc_seccomp <target> [args...]\n"); return 2; }
 
@@ -172,11 +179,26 @@ int main(int argc, char **argv) {
   int lf = recv_fd(sk[0]);
   if (lf < 0) { fprintf(stderr, "recv listener failed\n"); return 1; }
 
+  // Interrupt the blocking NOTIF_RECV when the target exits. Without SA_RESTART
+  // the ioctl returns EINTR on SIGCHLD; we then reap the child and stop.
+  int st;
+  struct sigaction sa = {0};
+  sa.sa_handler = on_sigchld;
+  sigaction(SIGCHLD, &sa, NULL);
+
   struct seccomp_notif *req = calloc(1, sizeof *req + 4096);
   struct seccomp_notif_resp *resp = calloc(1, sizeof *resp + 4096);
   for (;;) {
     memset(req, 0, sizeof *req);
-    if (ioctl(lf, SECCOMP_IOCTL_NOTIF_RECV, req)) { if (errno == EINTR) continue; break; }
+    if (ioctl(lf, SECCOMP_IOCTL_NOTIF_RECV, req)) {
+      // EINTR: a signal (e.g. SIGCHLD) interrupted the wait. If the target has
+      // exited, stop; otherwise keep waiting for the next notification.
+      if (errno == EINTR) {
+        if (waitpid(pid, &st, WNOHANG) == pid) return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+        continue;
+      }
+      break;
+    }
     char *path = read_path(req->pid, req->data.args[1]);
     if (path && is_remote(path)) {
       int ffd = open_fuse(path);
@@ -194,7 +216,6 @@ int main(int argc, char **argv) {
     ioctl(lf, SECCOMP_IOCTL_NOTIF_SEND, resp);
   }
 
-  int st;
   waitpid(pid, &st, 0);
   return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }

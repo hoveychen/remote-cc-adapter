@@ -24,7 +24,12 @@ func cmdServe(args []string) int {
 	listen := fs.String("listen", "/ip4/0.0.0.0/tcp/0", "comma-separated libp2p listen multiaddrs")
 	holePunch := fs.Bool("hole-punch", true, "enable DCUtR hole-punching in libp2p mode")
 	relays := fs.String("relays", "", "comma-separated circuit-relay peer multiaddrs (fallback)")
+	announce := fs.String("announce", "", "comma-separated public multiaddrs to advertise in the pairing code "+
+		"(e.g. /ip4/1.2.3.4/tcp/4001 when behind 1:1 NAT with an opened port); env RCA_SERVE_ANNOUNCE")
 	_ = fs.Parse(args)
+	if *announce == "" {
+		*announce = os.Getenv("RCA_SERVE_ANNOUNCE")
+	}
 
 	logger := log.New(os.Stderr, "rca serve ", log.LstdFlags|log.Lmsgprefix)
 
@@ -41,6 +46,7 @@ func cmdServe(args []string) int {
 			ListenAddrs:              splitCSV(*listen),
 			EnableHolePunching:       *holePunch,
 			ForceReachabilityPrivate: len(relayList) > 0,
+			AnnounceAddrs:            splitCSV(*announce),
 		})
 		if err != nil {
 			logger.Printf("libp2p host: %v", err)

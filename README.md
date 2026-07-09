@@ -212,7 +212,12 @@ READMEs ([`native/`](native/README.md), [`cmd/rca/embedded/`](cmd/rca/embedded/R
 
 Known limits: NAT traversal is enabled but not yet field-tested across real
 networks; relative-path opens (`open("rel")`) stay local by design (claude's
-tools use absolute paths).
+tools use absolute paths). On **Linux run mode the seccomp filter traps
+`openat` only**, so routed *file reads* work but *subprocess execution is not
+routed* — commands spawned by the target run on the local (client) machine, not
+the remote. macOS routes both (DYLD interposes `posix_spawn`). Routing Linux
+subprocesses needs a different mechanism (seccomp-notify can't rewrite `execve`
+args) and is not yet implemented.
 
 ## License
 
