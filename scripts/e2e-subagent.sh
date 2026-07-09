@@ -31,26 +31,24 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== build =="
-( cd "$REPO" && make go >/dev/null && make macos >/dev/null )
+( cd "$REPO" && make >/dev/null )   # native first, then rca embedding it
 
 echo "== stage routed file (only the subagent should read it) =="
 mkdir -p "$VFS"
 printf 'marker: %s\n' "$MARKER" > "$SUB_FILE"
 
 echo "== start executor =="
-"$REPO/bin/rcc-executor" -sock "$EXEC_SOCK" >"$EXEC_LOG" 2>&1 &
+"$REPO/bin/rca" serve --sock "$EXEC_SOCK" >"$EXEC_LOG" 2>&1 &
 EXEC_PID=$!
 for _ in $(seq 1 50); do [[ -S "$EXEC_SOCK" ]] && break; sleep 0.1; done
 
 echo "== run claude, instruct it to delegate the Read to a subagent =="
 PROMPT="Use the Task tool to launch a subagent. The subagent must Read the file ${SUB_FILE} and report the value after 'marker:'. Do NOT read the file yourself — delegate it to the subagent. Then report what the subagent found."
-OUT="$(RCC_LOG="$DYLIB_LOG" "$REPO/bin/remote-cc-adapter" \
-  --claude "$CLAUDE" --resign \
-  --dylib "$REPO/native/macos/rcc_interpose.dylib" \
-  --spawn-proxy "$REPO/bin/rcc-spawn-proxy" \
-  --executor-sock "$EXEC_SOCK" --adapter-sock "$ADAPTER_SOCK" \
+# rca defaults: resign on, dylib from the embedded artifact, spawn proxy = rca.
+OUT="$(RCC_LOG="$DYLIB_LOG" "$REPO/bin/rca" \
+  --sock "$EXEC_SOCK" --adapter-sock "$ADAPTER_SOCK" \
   --remote-prefix "$VFS" --workdir "$VFS" \
-  -- --model "$MODEL" --allowedTools Task Read \
+  "$CLAUDE" --model "$MODEL" --allowedTools Task Read \
   -p "$PROMPT" 2>>"$WORK/claude.err" || true)"
 echo "claude said: $OUT"
 

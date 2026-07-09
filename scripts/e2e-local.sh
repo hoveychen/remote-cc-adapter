@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# e2e-local.sh — drive the REAL claude CLI through remote-cc-adapter on one host,
-# proving that Read and Bash are redirected through the interceptor -> adapter ->
-# executor path (design doc §4.1.1). Executor is co-located here (local Unix
-# socket transport); true cross-host runs await the go-libp2p transport.
+# e2e-local.sh — drive the REAL claude CLI through rca on one host, proving that
+# Read and Bash are redirected through the interceptor -> adapter -> executor
+# path (design doc §4.1.1). Executor is co-located here (local Unix socket
+# transport); cross-host runs use `rca serve` + --code instead.
 #
 # Requirements: macOS, an installed & logged-in `claude`, Go, a C compiler.
 # Usage: scripts/e2e-local.sh
@@ -31,14 +31,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== build =="
-( cd "$REPO" && make go >/dev/null && make macos >/dev/null )
+( cd "$REPO" && make >/dev/null )   # native first, then rca embedding it
 
 echo "== stage routed file =="
 mkdir -p "$VFS"
 printf 'marker: %s\n' "$MARKER" > "$ROUTED_FILE"
 
 echo "== start executor =="
-"$REPO/bin/rcc-executor" -sock "$EXEC_SOCK" >"$EXEC_LOG" 2>&1 &
+"$REPO/bin/rca" serve --sock "$EXEC_SOCK" >"$EXEC_LOG" 2>&1 &
 EXEC_PID=$!
 for _ in $(seq 1 50); do [[ -S "$EXEC_SOCK" ]] && break; sleep 0.1; done
 
@@ -47,18 +47,16 @@ for _ in $(seq 1 50); do [[ -S "$EXEC_SOCK" ]] && break; sleep 0.1; done
 # remote by path/cwd automatically — no sentinel. claude's own credential/self
 # spawns (security, the claude binary) stay local via the interceptor's
 # local-binary allowlist, so auth still works.
+# rca defaults: resign on, dylib from the embedded artifact, spawn proxy = rca
+# itself. Only transport/routing/socket flags are explicit here.
 run_claude() {
   local prompt="$1"
-  "$REPO/bin/remote-cc-adapter" \
-    --claude "$CLAUDE" \
-    --resign \
-    --dylib "$REPO/native/macos/rcc_interpose.dylib" \
-    --spawn-proxy "$REPO/bin/rcc-spawn-proxy" \
-    --executor-sock "$EXEC_SOCK" \
+  "$REPO/bin/rca" \
+    --sock "$EXEC_SOCK" \
     --adapter-sock "$ADAPTER_SOCK" \
     --remote-prefix "$VFS" \
     --workdir "$VFS" \
-    -- --model "$MODEL" --allowedTools Read Bash -p "$prompt"
+    "$CLAUDE" --model "$MODEL" --allowedTools Read Bash -p "$prompt"
 }
 
 echo "== TEST 1: Read a routed file =="
