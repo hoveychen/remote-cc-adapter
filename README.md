@@ -1,166 +1,180 @@
-# remote-cc-adapter
+# remote-cc-adapter (`rca`)
 
-Run the [Claude Code](https://claude.com/claude-code) CLI locally, but make its
-**tool calls execute on another machine** — file reads/writes and subprocesses
-land in a remote sandbox — while Claude itself (the reasoning loop, tool
-schemas, transcript) stays byte-for-byte native. The model cannot perceive the
-split: there are no `mcp__` tool prefixes and no custom schemas, because the
-tool *implementations* are untouched. Only the syscalls beneath them
-(`open`/`read`/`posix_spawn`/…) are redirected.
+Run a CLI — typically [Claude Code](https://claude.com/claude-code) — locally,
+but make its **tool calls execute on another machine**: file reads/writes and
+subprocesses land in a remote sandbox, while the process itself (and for
+claude, the reasoning loop, tool schemas, transcript) stays byte-for-byte
+native on your machine. The model cannot perceive the split: there are no
+`mcp__` tool prefixes and no custom schemas, because the tool *implementations*
+are untouched. Only the syscalls beneath them (`open`/`read`/`posix_spawn`/…)
+are redirected.
 
-> **Status: early implementation, POC-validated design.** The core interception
-> mechanisms were validated end-to-end in a proof of concept on both macOS and
-> Linux (see [`docs/design.md`](docs/design.md) §4). This repository promotes
-> that POC into a structured, buildable codebase: the full Go pipeline is tested,
-> real-`claude` injection is verified end-to-end on macOS (Read/Write/Bash/
-> subagent/Grep/Glob), and filesystem IO-RPC runs over go-libp2p between hosts.
-> Bridging the subprocess path across machines and NAT-traversal field testing
-> are the next milestones. See [Status & roadmap](#status--roadmap) for exactly
-> what is and isn't wired.
+One Go binary, two sides:
+
+```sh
+# On the remote machine (the sandbox where files/subprocesses should live):
+remote$ rca serve
+pairing code:
+
+  rca1.JgAkCAESIPuT...
+
+# On your local machine (where claude runs and you type):
+local$ cd ~/work/project
+local$ rca claude --code rca1.JgAkCAESIPuT...
+```
+
+`claude` starts locally — interactive TUI and `-p` one-shots both work, since
+stdin/stdout never cross the network — but everything it reads, writes, greps,
+and every `Bash` command it runs happens on the remote. The link is go-libp2p:
+Noise-encrypted, addressed by PeerID (== public key), with DCUtR hole-punching
+for NAT traversal. The pairing code is self-contained (PeerID + addresses);
+there is no rendezvous server.
+
+> **Status: early implementation, POC-validated design.** The interception
+> mechanisms were validated end-to-end on macOS and Linux (see
+> [`docs/design.md`](docs/design.md) §4): real-`claude` injection with
+> Read/Write/Bash/subagent/Grep/Glob redirected, filesystem IO-RPC and
+> subprocess streams over go-libp2p, Linux lazy slicing over FUSE.
+> NAT-traversal field testing across real networks is the next milestone. See
+> [Status & roadmap](#status--roadmap).
 
 ## How it works
 
 ```
-        ┌───────────────────────── brain host ─────────────────────────┐
+        ┌───────────────────────── local host ─────────────────────────┐
         │                                                               │
-        │   claude (re-signed copy)          remote-cc-adapter (Go)     │
+        │   claude (re-signed copy)               rca (run mode)        │
         │  ┌──────────────────────┐         ┌───────────────────────┐   │
         │  │ native interceptor   │  fs     │ IO-RPC server          │   │
         │  │  macOS: interpose    │ IO-RPC  │  routing table:        │   │
-        │  │  Linux: seccomp      │────────▶│   local  → brain FS    │   │
+        │  │  Linux: seccomp      │────────▶│   local  → local FS    │   │
         │  │ (open/read/stat/…)   │  unix   │   remote → executor ───┼───┼──┐
         │  └──────────┬───────────┘  socket └───────────────────────┘   │  │
-        │             │ posix_spawn (routed)                             │  │
-        │             ▼                                                  │  │ transport
-        │      rcc-spawn-proxy ─────────────────────────────────────────┼──┤ (unix socket now,
-        │                                                               │  │  go-libp2p next)
+        │             │ posix_spawn (routed)                             │  │ go-libp2p
+        │             ▼                                                  │  │ (or unix socket
+        │      rca _spawn-proxy ────────────────────────────────────────┼──┤  when co-located)
+        │                                                               │  │
         └───────────────────────────────────────────────────────────────┘  │
                                                                             ▼
                                         ┌──────────── remote sandbox ────────────┐
-                                        │  rcc-executor (Go)                      │
+                                        │  rca serve                              │
                                         │   fs ops (open/pread slice/write/…)     │
                                         │   subprocess exec (stream stdout/stderr,│
                                         │     forward signals, real exit code)    │
                                         └─────────────────────────────────────────┘
 ```
 
-1. The **adapter** spawns `claude` with a native interceptor injected and serves
-   a filesystem IO-RPC socket.
-2. The **interceptor** (macOS interpose dylib / Linux seccomp supervisor) catches
-   the process's `open`/`read`/`stat`/`readdir` calls. Routed paths are forwarded
-   to the adapter; everything else falls through to the real local syscall so the
-   CLI boots, reads its credentials, and writes `~/.claude` locally.
+1. **Run mode** (`rca <command>`) spawns the target with a native interceptor
+   injected and serves a filesystem IO-RPC socket. The interceptor artifact
+   (macOS interpose dylib / Linux seccomp supervisor) is embedded in the `rca`
+   binary and extracted to the user cache dir at runtime.
+2. The **interceptor** catches the process's `open`/`read`/`stat`/`readdir`
+   calls. Routed paths are forwarded to the adapter; everything else falls
+   through to the real local syscall so the CLI boots, reads its credentials,
+   and writes `~/.claude` locally.
 3. The adapter consults its **routing table** and either serves the op on the
-   brain host's filesystem or relays it to the remote **executor**.
+   local filesystem or relays it to the remote **executor** (`rca serve`).
 4. Subprocesses (`Bash`, ripgrep for `Grep`/`Glob`, `git status`, …) are
-   rewritten to run on the executor via **`rcc-spawn-proxy`**, so metadata-heavy
+   rewritten to run on the executor via `rca _spawn-proxy`, so metadata-heavy
    traversals happen remotely and only the result crosses the wire.
 
 Why syscall-level interception rather than MCP replacement tools or a
-`can_use_tool` rewrite? Because those leak into what the model sees (tool names,
-schemas) or only cover `Bash`. Redirecting the syscalls beneath the native tools
-covers *all* tools with zero distribution shift. The full rationale — and the
-three rejected designs — is in [`docs/design.md`](docs/design.md) §2.
-
-## Repository layout
-
-| Path | What |
-|---|---|
-| [`cmd/remote-cc-adapter`](cmd/remote-cc-adapter) | Brain-side host: spawns `claude` injected, serves IO-RPC, routes ops. |
-| [`cmd/rcc-executor`](cmd/rcc-executor) | Remote sidecar: runs fs ops + subprocesses on the sandbox host. |
-| [`cmd/rcc-spawn-proxy`](cmd/rcc-spawn-proxy) | Stands in for a routed subprocess; streams it from the executor. |
-| [`cmd/rcc-fuse`](cmd/rcc-fuse) | Linux: FUSE daemon backing injected fds with lazy slices (`internal/linuxfuse`). |
-| [`internal/protocol`](internal/protocol) | Binary fs IO-RPC wire format (shared C↔Go↔Go). |
-| [`internal/execproto`](internal/execproto) | Streaming subprocess protocol (proxy↔executor). |
-| [`internal/routing`](internal/routing) | Path routing table (remote-allowlist / default-remote). |
-| [`internal/transport`](internal/transport) | Brain↔executor link: Unix socket + go-libp2p. |
-| [`internal/executor`](internal/executor) | fs + subprocess services and stream multiplexing. |
-| [`internal/adapter`](internal/adapter) | IO-RPC server, routing relay, claude launch/injection. |
-| [`native/macos`](native/macos) | DYLD interpose dylib. |
-| [`native/linux`](native/linux) | seccomp-user-notify supervisor. |
-| [`docs/design.md`](docs/design.md) | Full design + POC results. |
+`can_use_tool` rewrite? Because those leak into what the model sees (tool
+names, schemas) or only cover `Bash`. Redirecting the syscalls beneath the
+native tools covers *all* tools with zero distribution shift. The full
+rationale — and the three rejected designs — is in
+[`docs/design.md`](docs/design.md) §2.
 
 ## Build
 
 ```sh
-make            # Go binaries into ./bin + the host platform's interceptor
-make go         # just the Go binaries
-make native     # just the native interceptor for this platform
+make            # native interceptor for this platform, then rca (embeds it) into ./bin
 make test       # go test ./...
 ```
 
-Requirements: Go 1.24+, a C compiler. On Linux, building the supervisor needs
+Requirements: Go 1.25+, a C compiler. On Linux, building the supervisor needs
 kernel headers; running it needs `CAP_SYS_ADMIN` (or a user-namespace setup).
 
-## Run (local end-to-end, executor co-located)
+A plain `go build ./cmd/rca` also works but embeds no interceptor; run mode
+then needs `--dylib` / `--supervisor` pointing at an external build.
 
-This wires everything over a local Unix socket — the transport used when the
-brain and sandbox are the same host. Cross-machine runs await the go-libp2p
-transport (roadmap below).
+## Run
+
+### Cross-machine (pairing code)
 
 ```sh
-make
+# Remote sandbox host — prints the pairing code (PeerID + dialable addrs):
+remote$ rca serve
 
-# 1. Start the executor (this is the "remote" side; here it's local).
-./bin/rcc-executor -sock /tmp/rcc-exec.sock &
-
-# 2. Launch claude through the adapter. On macOS, --resign prepares an ad-hoc
-#    re-signed copy so the dylib can load (your real claude is untouched).
-./bin/remote-cc-adapter \
-  --claude "$(command -v claude)" \
-  --resign \
-  --dylib ./native/macos/rcc_interpose.dylib \
-  --spawn-proxy ./bin/rcc-spawn-proxy \
-  --executor-sock /tmp/rcc-exec.sock \
-  --remote-prefix "$PWD" \
-  -- -p "list the files in this directory"
+# Local host — run any command against it:
+local$ cd ~/work/project
+local$ rca claude --code rca1....                 # interactive TUI
+local$ rca claude --code rca1.... -p "list files" # non-interactive
 ```
 
-On Linux, drop `--resign`/`--dylib` and pass
-`--supervisor ./native/linux/rcc_seccomp` instead.
+`rca`'s own flags may appear anywhere on the line; anything else after the
+command name goes to the command verbatim, and everything after a literal `--`
+is never interpreted by `rca`. Defaults in run mode:
+
+- `--remote-prefix` defaults to the working directory — the project you `cd`
+  into is what lives remotely; claude's config/credentials stay local.
+- On macOS, `rca` runs an ad-hoc re-signed **copy** of the target so the
+  interpose dylib can load (`--resign=false` to disable; the real binary is
+  never touched).
+- The spawn proxy and interceptor come from the `rca` binary itself.
+
+### Co-located (one host, unix socket)
+
+Useful for testing the full pipeline without a second machine:
+
+```sh
+rca serve --sock /tmp/rcc-exec.sock &
+rca --sock /tmp/rcc-exec.sock --remote-prefix "$PWD" claude -p "list the files here"
+```
 
 `--print-cmd` prints the assembled launch command and injected environment
-without spawning anything — handy for inspecting exactly what would run.
-
-## Run (cross-machine over libp2p)
-
-To put the executor on a different machine, run it in libp2p mode and point the
-adapter at its peer address. The link is Noise-secured and identified by PeerID
-(== public key), with DCUtR hole-punching for NAT traversal.
-
-```sh
-# On the sandbox host: listen over libp2p; it prints its PeerID + multiaddrs.
-./bin/rcc-executor -libp2p /ip4/0.0.0.0/tcp/4001
-# -> serving on 12D3Koo... /ip4/.../tcp/4001/p2p/12D3Koo...
-
-# On the brain host: dial that peer instead of a unix socket.
-./bin/remote-cc-adapter \
-  --claude "$(command -v claude)" --resign \
-  --dylib ./native/macos/rcc_interpose.dylib \
-  --spawn-proxy ./bin/rcc-spawn-proxy \
-  --peer /ip4/<SANDBOX_IP>/tcp/4001/p2p/12D3Koo... \
-  --remote-prefix "$PWD" --workdir "$PWD" \
-  -- -p "read the files here"
-```
-
-Both filesystem IO-RPC and subprocesses (`Bash`, the ripgrep engine) flow over
-libp2p: the spawn proxy connects to a local exec-bridge socket the adapter
-serves, and the adapter splices each exec stream to the executor over the shared
-libp2p connection. The proxy never speaks libp2p itself.
+without spawning anything; `--peer <multiaddr>` dials a raw libp2p address if
+you'd rather not use a pairing code.
 
 ## Routing
 
 Two policies (`internal/routing`):
 
 - **remote-allowlist** (default): everything is local except `--remote-prefix`
-  paths. This is the surgical routing the end-to-end POC validated — `claude`
-  boots and reads its own config locally, only your work paths route remote.
+  paths (default: the working directory). This is the surgical routing the
+  end-to-end POC validated — `claude` boots and reads its own config locally,
+  only your work paths route remote.
 - **default-remote** (`--default-remote`, design target): everything is remote
-  except `--local-prefix` paths (e.g. `~/.claude`, CLI internals). More
-  aggressive; enable deliberately.
+  except `--local-prefix` paths. More aggressive; enable deliberately.
 
-`~/.claude` (global `CLAUDE.md`, skills, memory, settings) must always resolve
-locally — the adapter never routes a user's global config to the sandbox.
+`~/.claude` (global `CLAUDE.md`, skills, memory, settings) and `~/.claude.json`
+always resolve locally — even under `--default-remote`, `rca` pins them so a
+user's global config and credentials never route to the sandbox.
+
+**Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
+precedence first: rg-mode self-invocation under a remote cwd → local-binary
+allowlist (keychain `security`, `pbcopy`, `tmux`, the spawn proxy, claude
+itself; extend via `RCC_LOCAL_BINS`) → sentinel in argv → target under a remote
+prefix → working directory under a remote prefix → local. Routed children run
+with the injection environment stripped and `argv[0]` preserved so
+argv[0]-sensitive binaries (claude's embedded ripgrep) behave correctly.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| [`cmd/rca`](cmd/rca) | The single binary: `serve`, run mode, `_spawn-proxy`, `_fuse`, embedded artifacts. |
+| [`internal/protocol`](internal/protocol) | Binary fs IO-RPC wire format (shared C↔Go↔Go). |
+| [`internal/execproto`](internal/execproto) | Streaming subprocess protocol (proxy↔executor). |
+| [`internal/routing`](internal/routing) | Path routing table (remote-allowlist / default-remote). |
+| [`internal/transport`](internal/transport) | Local↔executor link: Unix socket + go-libp2p. |
+| [`internal/paircode`](internal/paircode) | Self-contained pairing code (PeerID + multiaddrs). |
+| [`internal/executor`](internal/executor) | fs + subprocess services and stream multiplexing. |
+| [`internal/adapter`](internal/adapter) | IO-RPC server, routing relay, target launch/injection. |
+| [`internal/linuxfuse`](internal/linuxfuse) | Linux lazy-slice FUSE filesystem behind `rca _fuse`. |
+| [`native/macos`](native/macos) | DYLD interpose dylib (embedded into `rca` by `make`). |
+| [`native/linux`](native/linux) | seccomp-user-notify supervisor (embedded into `rca` by `make`). |
+| [`docs/design.md`](docs/design.md) | Full design + POC results. |
 
 ## Status & roadmap
 
@@ -168,64 +182,26 @@ locally — the adapter never routes a user's global config to the sandbox.
 
 - Binary IO-RPC and subprocess protocols round-trip (`internal/protocol`,
   `internal/execproto`).
-- Routing table for both policies (`internal/routing`).
+- Routing table for both policies (`internal/routing`); pairing code
+  round-trips (`internal/paircode`).
 - Adapter ↔ executor end-to-end over real Unix sockets: `stat`/`open`/`pread`
   slice/`write`/`readdir` route to the correct side with handle namespacing
   (`internal/adapter` integration test).
-- Executor subprocess streaming: stdout/stderr split, exit-code fidelity
-  (`internal/executor` exec test).
-- Background tasks (`run_in_background`): long-running commands stream output
-  incrementally, and a forwarded signal (KillBash) terminates the whole process
-  group — a routed child runs in its own group so killing `/bin/sh` also kills
-  its `sleep`, otherwise an orphan holds the pipe open and the exit never lands
-  (`internal/executor` bgtask test). A real-claude background Bash was observed
-  running on the executor and streaming its output back over the pipe.
-- Both native interceptors compile clean (macOS dylib, Linux seccomp), verified
-  on macOS and in a Linux container.
-- **Real `claude` injection, end-to-end on macOS** (`scripts/e2e-local.sh`): a
-  re-signed claude with the dylib injected has both Read and Bash redirected to
-  the executor. Read of a routed file shows OPEN+PREAD in the executor log and
-  returns the file's content; Bash run with claude's cwd under the remote prefix
-  executes on the executor (observable via the `RCC_EXECUTOR=1` marker) — routed
-  **naturally by cwd, no sentinel**. claude's own credential/self spawns
-  (`security`, the claude binary) stay local via the interceptor's local-binary
-  allowlist.
-
-- **Remote Grep/Glob, correct and via one remote ripgrep** (real claude): claude
-  runs Grep/Glob by re-exec'ing itself as its embedded ripgrep (it enters that
-  mode when `argv[0]`'s basename is `rg`). Recursive Glob over a routed project
-  finds nested files (dirent types carry `DTDir` so ripgrep recurses), and the
-  rg engine is routed to the executor as a single native subprocess with
-  `argv[0]` preserved — so its directory walk runs on the executor's real
-  filesystem in one pass instead of as a per-syscall fs-interpose metadata storm
-  (design doc §4.1 pt5).
-
-- **Filesystem IO-RPC over go-libp2p** (`internal/transport`, tested): two
-  loopback libp2p hosts (Noise-secured, PeerID-addressed) carry the adapter ↔
-  executor fs-RPC; a remote-routed `stat`/`open`/`pread` is served on the peer
-  while local paths stay on the brain. `rcc-executor -libp2p` prints its PeerID +
-  multiaddrs; `remote-cc-adapter --peer <multiaddr>` dials it. DCUtR
+- Executor subprocess streaming: stdout/stderr split, exit-code fidelity,
+  background tasks with process-group signal forwarding (`internal/executor`).
+- **Real `claude` injection, end-to-end on macOS** (`scripts/e2e-local.sh`):
+  Read and Bash redirected to the executor, routed naturally by cwd with no
+  sentinel; claude's credential/self spawns stay local. Subagents inherit the
+  injection (`scripts/e2e-subagent.sh`). Grep/Glob run as one remote ripgrep
+  with `argv[0]` preserved.
+- **Filesystem IO-RPC and subprocesses over go-libp2p** (`internal/transport`,
+  `internal/adapter`): Noise-secured, PeerID-addressed; the exec bridge splices
+  the spawn proxy's local unix connection to a libp2p stream. DCUtR
   hole-punching and circuit-relay fallback are enabled in the host config.
-- **Subprocesses over go-libp2p** (`internal/adapter`, tested): the adapter's
-  exec bridge splices the spawn proxy's local unix connection to a libp2p stream,
-  so a command runs on a libp2p-remote executor end-to-end. The bridge is also
-  in-path co-located and does not disturb the real-claude Bash e2e.
-- **Linux lazy slicing over FUSE** (`internal/linuxfuse`, `cmd/rcc-fuse`,
-  `native/linux`; verified in a privileged container by `scripts/linux-fuse-test.sh`):
-  the seccomp supervisor redirects a routed `openat` to a FUSE-backed file served
-  by `rcc-fuse`, which fetches each read as an on-demand slice from the adapter.
-  A raw consumer reads a 25-byte slice at 5 MiB of a 10 MiB routed file through
-  the full FUSE → adapter → executor chain and only **4096 bytes** cross the
-  fs-RPC — no whole-file materialisation, and the target's other reads are
-  untouched (design doc §4.1.3 / §4.3).
-
-**Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
-precedence first: rg-mode self-invocation under a remote cwd → local-binary
-allowlist → sentinel in argv → target under a remote prefix → working directory
-under a remote prefix → local. This lets a subprocess of a remote-routed project
-run where the project lives while claude's own tooling stays local. Routed
-children run with the injection environment stripped (no re-injection), and with
-`argv[0]` preserved so argv[0]-sensitive binaries behave correctly.
+- **Linux lazy slicing over FUSE** (`internal/linuxfuse`, verified in a
+  privileged container by `scripts/linux-fuse-test.sh`): a routed `openat` is
+  redirected to a FUSE-backed file served by `rca _fuse`; a 25-byte read at
+  5 MiB of a 10 MiB file moves only 4096 bytes over the fs-RPC.
 
 **Next milestones:**
 
