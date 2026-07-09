@@ -477,10 +477,14 @@ int my_gde64(int fd, void *buf, size_t nbytes, long *basep) {
 // Extend via RCC_LOCAL_BINS (':'-joined substrings).
 static int spawn_is_local_bin(const char *path) {
   if (!path) return 0;
-  static const char *defaults[] = {"/usr/bin/security", "rcc-spawn-proxy",
-                                    "pbcopy", "tmux", NULL};
+  static const char *defaults[] = {"/usr/bin/security", "pbcopy", "tmux", NULL};
   for (int i = 0; defaults[i]; i++)
     if (strstr(path, defaults[i])) return 1;
+  // The spawn proxy (the rca binary) is matched by its full path from the env,
+  // not by a name substring — "rca" alone would false-positive on any path
+  // containing those three letters.
+  const char *proxy = getenv("RCC_SPAWN_PROXY");
+  if (proxy && *proxy && strstr(path, proxy)) return 1;
   const char *claude = getenv("RCC_CLAUDE_PATH");
   if (claude && *claude && strstr(path, claude)) return 1;
   const char *bins = getenv("RCC_LOCAL_BINS");

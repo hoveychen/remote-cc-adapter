@@ -17,7 +17,7 @@
 // Lazy slicing (design doc §4.1.3 step 2 / §4.3): seccomp only traps openat, so
 // the injected fd's later read/lseek are real syscalls we no longer see. Rather
 // than fetch the whole file up front, the injected fd points at a FUSE file
-// backed by cmd/rcc-fuse, which serves each read as an on-demand slice from the
+// backed by `rca _fuse` (internal/linuxfuse), which serves each read as an on-demand slice from the
 // adapter. Only files opened through the mount incur FUSE callbacks, so the
 // target's other I/O is untouched.
 //
@@ -124,7 +124,7 @@ static int is_remote(const char *path) {
 // ---- FUSE-backed redirection -----------------------------------------------
 
 // open_fuse opens the routed path's FUSE-backed file under RCC_FUSE_MNT and
-// returns the fd (caller injects it). The FUSE daemon (cmd/rcc-fuse) serves that
+// returns the fd (caller injects it). The FUSE daemon (`rca _fuse`) serves that
 // file's reads by fetching slices from the adapter on demand, so nothing is
 // materialised up front. The entry name is hex(path), matching
 // linuxfuse.EncodePath — hex avoids '/' in the FUSE entry name.

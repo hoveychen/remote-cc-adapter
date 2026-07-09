@@ -1,5 +1,5 @@
 // Package execproto is the streaming wire format between the subprocess proxy
-// (cmd/rcc-spawn-proxy, exec'd in place of a subprocess by the native
+// (`rca _spawn-proxy`, exec'd in place of a subprocess by the native
 // interceptor) and the executor's subprocess service.
 //
 // It mirrors the POC's remote_run.py <-> exec_server.py protocol (design doc

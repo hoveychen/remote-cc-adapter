@@ -12,7 +12,7 @@ import (
 // transport the adapter uses (unix socket or libp2p), without the proxy needing
 // to speak libp2p itself.
 //
-// The proxy (cmd/rcc-spawn-proxy, exec'd by the interceptor for a routed
+// The proxy (`rca _spawn-proxy`, exec'd by the interceptor for a routed
 // subprocess) connects to the bridge's local unix socket and speaks execproto.
 // The bridge does not parse that protocol — it opens one transport stream to the
 // executor and splices bytes both ways. The executor's stream-kind prefix (the
