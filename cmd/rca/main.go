@@ -79,7 +79,14 @@ Serve flags: --listen, --sock, --hole-punch, --relays.
 `)
 }
 
+// version is stamped by release builds via -ldflags "-X main.version=v1.2.3"
+// (see scripts/build-release.sh); source builds fall back to module build info.
+var version string
+
 func versionString() string {
+	if version != "" {
+		return "rca " + version
+	}
 	v := "rca (devel)"
 	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
 		v = "rca " + bi.Main.Version

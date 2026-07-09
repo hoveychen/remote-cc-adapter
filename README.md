@@ -9,8 +9,6 @@ native on your machine. The model cannot perceive the split: there are no
 are untouched. Only the syscalls beneath them (`open`/`read`/`posix_spawn`/…)
 are redirected.
 
-One Go binary, two sides:
-
 ```sh
 # On the remote machine (the sandbox where files/subprocesses should live):
 remote$ rca serve
@@ -25,18 +23,89 @@ local$ rca claude --code rca1.JgAkCAESIPuT...
 
 `claude` starts locally — interactive TUI and `-p` one-shots both work, since
 stdin/stdout never cross the network — but everything it reads, writes, greps,
-and every `Bash` command it runs happens on the remote. The link is go-libp2p:
-Noise-encrypted, addressed by PeerID (== public key), with DCUtR hole-punching
-for NAT traversal. The pairing code is self-contained (PeerID + addresses);
-there is no rendezvous server.
+and every `Bash` command it runs happens on the remote.
 
-> **Status: early implementation, POC-validated design.** The interception
-> mechanisms were validated end-to-end on macOS and Linux (see
-> [`docs/design.md`](docs/design.md) §4): real-`claude` injection with
-> Read/Write/Bash/subagent/Grep/Glob redirected, filesystem IO-RPC and
-> subprocess streams over go-libp2p, Linux lazy slicing over FUSE.
-> NAT-traversal field testing across real networks is the next milestone. See
-> [Status & roadmap](#status--roadmap).
+## Install
+
+Grab the single binary from
+[Releases](https://github.com/hoveychen/remote-cc-adapter/releases) — one
+archive per platform, interceptor included:
+
+```sh
+# macOS (Apple silicon)
+curl -fsSL https://github.com/hoveychen/remote-cc-adapter/releases/latest/download/rca_darwin_arm64.tar.gz | tar xz
+# macOS (Intel)
+curl -fsSL https://github.com/hoveychen/remote-cc-adapter/releases/latest/download/rca_darwin_amd64.tar.gz | tar xz
+# Linux (x86_64)
+curl -fsSL https://github.com/hoveychen/remote-cc-adapter/releases/latest/download/rca_linux_amd64.tar.gz | tar xz
+# Linux (arm64)
+curl -fsSL https://github.com/hoveychen/remote-cc-adapter/releases/latest/download/rca_linux_arm64.tar.gz | tar xz
+
+sudo install -m 755 rca /usr/local/bin/rca   # or anywhere on your PATH
+rca version
+```
+
+`checksums.txt` on each release carries the sha256 of every archive.
+
+Or build from source (Go 1.25+, a C compiler):
+
+```sh
+make          # native interceptor for this platform, then rca (embeds it) into ./bin
+```
+
+## Usage
+
+### 1. Pair the two machines
+
+On the **remote** machine (where the project files live and commands should
+execute):
+
+```sh
+rca serve
+```
+
+It prints a pairing code — a self-contained `rca1.…` string packing its libp2p
+identity and addresses. There is no rendezvous server; copy the code once.
+
+### 2. Run your CLI locally against the remote
+
+On the **local** machine:
+
+```sh
+cd ~/work/project          # the directory that lives on the remote
+rca claude --code rca1.…                  # interactive TUI
+rca claude --code rca1.… -p "fix the failing test"   # non-interactive
+```
+
+Any user-installed CLI works, not just claude — `rca <command> [args…]` runs
+`<command>` locally with its filesystem and subprocesses transparently routed.
+(On macOS, Apple system binaries like `/bin/sh` cannot be injected — the OS
+kills copies of trust-cached binaries — so target user-installed tools.)
+
+Useful flags (they may appear anywhere on the line; everything after a literal
+`--` goes to the command verbatim):
+
+| Flag | Meaning |
+|---|---|
+| `--code <rca1.…>` | connect to a `rca serve` remote (from its output) |
+| `--remote-prefix <path>` | path prefix routed remote; **default: the working directory** |
+| `--workdir <dir>` | working directory for the command (default: cwd) |
+| `--default-remote` | route *everything* remote except `--local-prefix` paths |
+| `--resign=false` | macOS: skip running an ad-hoc re-signed copy of the target |
+| `--sock <path>` | co-located mode: dial an executor unix socket instead of libp2p |
+| `--peer <multiaddr>` | dial a raw libp2p multiaddr instead of a pairing code |
+| `--print-cmd` | print the assembled launch command + env, spawn nothing |
+
+Defaults are chosen so the common case needs zero flags: the project you `cd`
+into routes remote; claude's own config and credentials (`~/.claude`,
+`~/.claude.json`) always stay local, even under `--default-remote`.
+
+### Co-located testing (one host)
+
+```sh
+rca serve --sock /tmp/rcc-exec.sock &
+rca --sock /tmp/rcc-exec.sock claude -p "list the files here"
+```
 
 ## How it works
 
@@ -65,156 +134,52 @@ there is no rendezvous server.
 ```
 
 1. **Run mode** (`rca <command>`) spawns the target with a native interceptor
-   injected and serves a filesystem IO-RPC socket. The interceptor artifact
-   (macOS interpose dylib / Linux seccomp supervisor) is embedded in the `rca`
-   binary and extracted to the user cache dir at runtime.
+   injected — a DYLD interpose dylib on macOS, a seccomp-user-notify supervisor
+   on Linux. Both are embedded in the `rca` binary and extracted to the user
+   cache dir at runtime.
 2. The **interceptor** catches the process's `open`/`read`/`stat`/`readdir`
-   calls. Routed paths are forwarded to the adapter; everything else falls
-   through to the real local syscall so the CLI boots, reads its credentials,
+   syscalls. Routed paths are forwarded to the adapter; everything else falls
+   through to the real local syscall, so the CLI boots, reads its credentials,
    and writes `~/.claude` locally.
-3. The adapter consults its **routing table** and either serves the op on the
-   local filesystem or relays it to the remote **executor** (`rca serve`).
-4. Subprocesses (`Bash`, ripgrep for `Grep`/`Glob`, `git status`, …) are
-   rewritten to run on the executor via `rca _spawn-proxy`, so metadata-heavy
-   traversals happen remotely and only the result crosses the wire.
+3. The adapter's **routing table** either serves the op on the local filesystem
+   or relays it to the remote **executor** (`rca serve`). Large files move as
+   on-demand slices, never materialised whole (on Linux via a lazy FUSE mount,
+   `rca _fuse`).
+4. **Subprocesses** (`Bash`, ripgrep for `Grep`/`Glob`, `git`, …) spawned under
+   a remote-routed directory are rewritten to `rca _spawn-proxy`, which streams
+   them from the executor — stdout/stderr, signals, and exit codes are relayed,
+   and `argv[0]` is preserved so argv[0]-sensitive binaries (claude's embedded
+   ripgrep) behave correctly. Credential/self spawns (keychain `security`,
+   claude itself, `pbcopy`, `tmux`) always stay local.
+5. The **transport** is go-libp2p: Noise-encrypted, addressed by PeerID
+   (== public key), with DCUtR hole-punching for NAT traversal. The pairing
+   code packs the PeerID and dialable addresses — trust is pinned to the key,
+   not the network path.
 
 Why syscall-level interception rather than MCP replacement tools or a
 `can_use_tool` rewrite? Because those leak into what the model sees (tool
 names, schemas) or only cover `Bash`. Redirecting the syscalls beneath the
 native tools covers *all* tools with zero distribution shift. The full
-rationale — and the three rejected designs — is in
-[`docs/design.md`](docs/design.md) §2.
+rationale, the three rejected designs, and the POC evidence are in
+[`docs/design.md`](docs/design.md).
 
-## Build
+## Development
 
 ```sh
-make            # native interceptor for this platform, then rca (embeds it) into ./bin
+make            # native interceptor + rca into ./bin
 make test       # go test ./...
+scripts/e2e-paircode.sh   # full pipeline e2e, no claude needed (also runs in CI)
+scripts/e2e-local.sh      # real-claude e2e (macOS, logged-in claude required)
+scripts/build-release.sh  # release archives for this host OS into ./dist
 ```
 
-Requirements: Go 1.25+, a C compiler. On Linux, building the supervisor needs
-kernel headers; running it needs `CAP_SYS_ADMIN` (or a user-namespace setup).
+Repository layout, verified-status details, and the roadmap live in
+[`docs/design.md`](docs/design.md); the per-component map is in the directory
+READMEs ([`native/`](native/README.md), [`cmd/rca/embedded/`](cmd/rca/embedded/README.md)).
 
-A plain `go build ./cmd/rca` also works but embeds no interceptor; run mode
-then needs `--dylib` / `--supervisor` pointing at an external build.
-
-## Run
-
-### Cross-machine (pairing code)
-
-```sh
-# Remote sandbox host — prints the pairing code (PeerID + dialable addrs):
-remote$ rca serve
-
-# Local host — run any command against it:
-local$ cd ~/work/project
-local$ rca claude --code rca1....                 # interactive TUI
-local$ rca claude --code rca1.... -p "list files" # non-interactive
-```
-
-`rca`'s own flags may appear anywhere on the line; anything else after the
-command name goes to the command verbatim, and everything after a literal `--`
-is never interpreted by `rca`. Defaults in run mode:
-
-- `--remote-prefix` defaults to the working directory — the project you `cd`
-  into is what lives remotely; claude's config/credentials stay local.
-- On macOS, `rca` runs an ad-hoc re-signed **copy** of the target so the
-  interpose dylib can load (`--resign=false` to disable; the real binary is
-  never touched).
-- The spawn proxy and interceptor come from the `rca` binary itself.
-
-### Co-located (one host, unix socket)
-
-Useful for testing the full pipeline without a second machine:
-
-```sh
-rca serve --sock /tmp/rcc-exec.sock &
-rca --sock /tmp/rcc-exec.sock --remote-prefix "$PWD" claude -p "list the files here"
-```
-
-`--print-cmd` prints the assembled launch command and injected environment
-without spawning anything; `--peer <multiaddr>` dials a raw libp2p address if
-you'd rather not use a pairing code.
-
-## Routing
-
-Two policies (`internal/routing`):
-
-- **remote-allowlist** (default): everything is local except `--remote-prefix`
-  paths (default: the working directory). This is the surgical routing the
-  end-to-end POC validated — `claude` boots and reads its own config locally,
-  only your work paths route remote.
-- **default-remote** (`--default-remote`, design target): everything is remote
-  except `--local-prefix` paths. More aggressive; enable deliberately.
-
-`~/.claude` (global `CLAUDE.md`, skills, memory, settings) and `~/.claude.json`
-always resolve locally — even under `--default-remote`, `rca` pins them so a
-user's global config and credentials never route to the sandbox.
-
-**Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
-precedence first: rg-mode self-invocation under a remote cwd → local-binary
-allowlist (keychain `security`, `pbcopy`, `tmux`, the spawn proxy, claude
-itself; extend via `RCC_LOCAL_BINS`) → sentinel in argv → target under a remote
-prefix → working directory under a remote prefix → local. Routed children run
-with the injection environment stripped and `argv[0]` preserved so
-argv[0]-sensitive binaries (claude's embedded ripgrep) behave correctly.
-
-## Repository layout
-
-| Path | What |
-|---|---|
-| [`cmd/rca`](cmd/rca) | The single binary: `serve`, run mode, `_spawn-proxy`, `_fuse`, embedded artifacts. |
-| [`internal/protocol`](internal/protocol) | Binary fs IO-RPC wire format (shared C↔Go↔Go). |
-| [`internal/execproto`](internal/execproto) | Streaming subprocess protocol (proxy↔executor). |
-| [`internal/routing`](internal/routing) | Path routing table (remote-allowlist / default-remote). |
-| [`internal/transport`](internal/transport) | Local↔executor link: Unix socket + go-libp2p. |
-| [`internal/paircode`](internal/paircode) | Self-contained pairing code (PeerID + multiaddrs). |
-| [`internal/executor`](internal/executor) | fs + subprocess services and stream multiplexing. |
-| [`internal/adapter`](internal/adapter) | IO-RPC server, routing relay, target launch/injection. |
-| [`internal/linuxfuse`](internal/linuxfuse) | Linux lazy-slice FUSE filesystem behind `rca _fuse`. |
-| [`native/macos`](native/macos) | DYLD interpose dylib (embedded into `rca` by `make`). |
-| [`native/linux`](native/linux) | seccomp-user-notify supervisor (embedded into `rca` by `make`). |
-| [`docs/design.md`](docs/design.md) | Full design + POC results. |
-
-## Status & roadmap
-
-**Verified in this repo (tests + local builds + CI):**
-
-- Binary IO-RPC and subprocess protocols round-trip (`internal/protocol`,
-  `internal/execproto`).
-- Routing table for both policies (`internal/routing`); pairing code
-  round-trips (`internal/paircode`).
-- Adapter ↔ executor end-to-end over real Unix sockets: `stat`/`open`/`pread`
-  slice/`write`/`readdir` route to the correct side with handle namespacing
-  (`internal/adapter` integration test).
-- Executor subprocess streaming: stdout/stderr split, exit-code fidelity,
-  background tasks with process-group signal forwarding (`internal/executor`).
-- **Real `claude` injection, end-to-end on macOS** (`scripts/e2e-local.sh`):
-  Read and Bash redirected to the executor, routed naturally by cwd with no
-  sentinel; claude's credential/self spawns stay local. Subagents inherit the
-  injection (`scripts/e2e-subagent.sh`). Grep/Glob run as one remote ripgrep
-  with `argv[0]` preserved.
-- **Filesystem IO-RPC and subprocesses over go-libp2p** (`internal/transport`,
-  `internal/adapter`): Noise-secured, PeerID-addressed; the exec bridge splices
-  the spawn proxy's local unix connection to a libp2p stream. DCUtR
-  hole-punching and circuit-relay fallback are enabled in the host config.
-- **Linux lazy slicing over FUSE** (`internal/linuxfuse`, verified in a
-  privileged container by `scripts/linux-fuse-test.sh`): a routed `openat` is
-  redirected to a FUSE-backed file served by `rca _fuse`; a 25-byte read at
-  5 MiB of a 10 MiB file moves only 4096 bytes over the fs-RPC.
-
-**Next milestones:**
-
-- **NAT-traversal field testing.** Hole-punching + relay options are enabled but
-  only loopback-tested; real cross-NAT verification needs two hosts and a relay.
-- **Natural routing of bare relative fs opens.** Files opened by absolute path
-  (what claude's Read/Write tools do) route correctly; `open("rel")` /
-  `openat(AT_FDCWD, "rel")` are left local because routing every relative open
-  against the cwd destabilises claude's boot. Needs a safer cwd-scoped policy
-  (design doc §4.3).
-
-See [`docs/design.md`](docs/design.md) for the complete design and the POC
-evidence behind every claim above.
+Known limits: NAT traversal is enabled but not yet field-tested across real
+networks; relative-path opens (`open("rel")`) stay local by design (claude's
+tools use absolute paths).
 
 ## License
 
