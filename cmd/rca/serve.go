@@ -7,6 +7,7 @@ package main
 // mode it prints a pairing code that the local side passes as --code.
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/hoveychen/remote-cc-adapter/internal/executor"
 	"github.com/hoveychen/remote-cc-adapter/internal/transport"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func cmdServe(args []string) int {
@@ -34,17 +36,22 @@ func cmdServe(args []string) int {
 			return 1
 		}
 	} else {
+		relayList := splitCSV(*relays)
 		h, err := transport.NewLibp2pHost(transport.HostConfig{
-			ListenAddrs:        splitCSV(*listen),
-			EnableHolePunching: *holePunch,
-			StaticRelays:       splitCSV(*relays),
+			ListenAddrs:              splitCSV(*listen),
+			EnableHolePunching:       *holePunch,
+			ForceReachabilityPrivate: len(relayList) > 0,
 		})
 		if err != nil {
 			logger.Printf("libp2p host: %v", err)
 			return 1
 		}
+		var reserved []peer.ID
+		if len(relayList) > 0 {
+			reserved = transport.ReserveRelays(context.Background(), h, relayList, logger)
+		}
 		ln = transport.ListenLibp2p(h)
-		printPairingCode(h, logger)
+		printPairingCode(h, relayList, reserved, logger)
 	}
 	defer ln.Close()
 

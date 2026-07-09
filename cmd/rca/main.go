@@ -35,6 +35,8 @@ func dispatch(args []string) int {
 	switch args[0] {
 	case "serve":
 		return cmdServe(args[1:])
+	case "relay":
+		return cmdRelay(args[1:])
 	case "_spawn-proxy":
 		return cmdSpawnProxy(args[1:])
 	case "_fuse":
@@ -54,6 +56,7 @@ func usage(w io.Writer) {
 
 Usage:
   rca serve [flags]                 remote side: executor + pairing code
+  rca relay [flags]                 run a circuit-relay v2 relay for NAT traversal
   rca <command> [args...] [flags]   local side: run <command> routed to the remote
   rca version                       print version
 
@@ -76,6 +79,8 @@ Advanced run-mode flags: --adapter-sock, --spawn-sentinel, --dylib,
 --supervisor, --spawn-proxy, --fuse-mount.
 
 Serve flags: --listen, --sock, --hole-punch, --relays.
+Relay flags: --listen (default /ip4/0.0.0.0/tcp/8080/ws), --announce
+(env RCA_RELAY_ANNOUNCE); identity via env RCA_RELAY_KEY.
 `)
 }
 

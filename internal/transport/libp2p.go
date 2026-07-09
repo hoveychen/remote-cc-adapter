@@ -29,9 +29,16 @@ type HostConfig struct {
 	// (the PeerID is that key's hash — trust is pinned by exchanging PeerIDs).
 	PrivKey crypto.PrivKey
 	// EnableHolePunching turns on DCUtR direct-connection upgrade for NAT
-	// traversal; StaticRelays are circuit-relay v2 multiaddrs used as fallback.
+	// traversal (both the NAT'd serve and the local dialer set it).
 	EnableHolePunching bool
-	StaticRelays       []string
+	// ForceReachabilityPrivate marks the host as behind NAT so it acts as the
+	// DCUtR initiator; set it on a serve that reserves on a relay. Explicit
+	// reservations are made with ReserveRelays, not AutoRelay.
+	ForceReachabilityPrivate bool
+	// AnnounceAddrs, if set, are extra multiaddrs appended to what the host
+	// advertises (e.g. the public "/dns4/host/tcp/443/tls/ws" a relay is
+	// reachable at behind an HTTPS proxy that the host itself cannot observe).
+	AnnounceAddrs []string
 }
 
 // NewLibp2pHost builds a libp2p host with Noise/TLS security (PeerID == public
@@ -52,10 +59,30 @@ func NewLibp2pHost(cfg HostConfig) (host.Host, error) {
 	if cfg.EnableHolePunching {
 		opts = append(opts, libp2p.EnableHolePunching())
 	}
-	if relays := parseAddrInfos(cfg.StaticRelays); len(relays) > 0 {
-		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(relays))
+	if cfg.ForceReachabilityPrivate {
+		opts = append(opts, libp2p.ForceReachabilityPrivate())
+	}
+	if announce := parseMultiaddrs(cfg.AnnounceAddrs); len(announce) > 0 {
+		opts = append(opts, libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			return append(announce, addrs...)
+		}))
 	}
 	return libp2p.New(opts...)
+}
+
+// parseMultiaddrs best-effort parses plain multiaddr strings (no /p2p/ suffix
+// required), dropping any that fail to parse.
+func parseMultiaddrs(addrs []string) []multiaddr.Multiaddr {
+	var out []multiaddr.Multiaddr
+	for _, a := range addrs {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		if ma, err := multiaddr.NewMultiaddr(a); err == nil {
+			out = append(out, ma)
+		}
+	}
+	return out
 }
 
 // parseAddrInfos best-effort parses p2p multiaddrs into peer.AddrInfo.
@@ -163,6 +190,11 @@ func (d *Libp2pDialer) Dial(ctx context.Context) (Stream, error) {
 			return nil, fmt.Errorf("transport: connect peer: %w", err)
 		}
 	}
+	// Allow the stream to ride a limited (circuit-relay) connection. DCUtR still
+	// tries to upgrade to a direct connection first; without this, opening a
+	// stream over a relay-only peer blocks until the hole-punch succeeds and
+	// fails if it can't — defeating the relay fallback.
+	ctx = network.WithAllowLimitedConn(ctx, "rcc")
 	s, err := d.h.NewStream(ctx, d.peer.ID, RCCProtocol)
 	if err != nil {
 		return nil, fmt.Errorf("transport: open stream: %w", err)
