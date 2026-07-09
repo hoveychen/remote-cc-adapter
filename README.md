@@ -107,6 +107,39 @@ rca serve --sock /tmp/rcc-exec.sock &
 rca --sock /tmp/rcc-exec.sock claude -p "list the files here"
 ```
 
+### NAT traversal with a relay
+
+The pairing code packs the remote's dialable addresses, so when the remote is
+directly reachable (public IP, LAN, or an SSH tunnel you set up yourself) the
+local side connects straight to it. When the remote sits behind NAT and has no
+reachable address, run a **circuit-relay** on a host both sides *can* reach and
+point the remote at it:
+
+```sh
+# On a host with a public address (raw TCP works; WebSocket lets it sit behind
+# an HTTPS reverse proxy that only exposes :8080 and terminates TLS):
+relay$ rca relay --announce /dns4/relay.example.com/tcp/443/tls/ws
+  relay peer id: 12D3Koo…
+  # pin a stable identity across restarts:
+  RCA_RELAY_KEY=… rca relay …
+
+# On the NAT'd remote — reserve a slot on the relay; the pairing code then
+# carries a relayed /p2p-circuit address in addition to the direct ones:
+remote$ rca serve --relays /dns4/relay.example.com/tcp/443/tls/ws/p2p/12D3Koo…
+
+# On the local machine — nothing changes; --code just works:
+local$  rca claude --code rca1.…
+```
+
+The local side dials the remote through the relay, then libp2p's DCUtR
+hole-punching tries to **upgrade to a direct connection**; if the NATs can't be
+punched it keeps relaying (all traffic then transits the relay — a direct
+upgrade needs at least one side to present a reachable public endpoint). A
+`Dockerfile` at the repo root builds a relay image for a PaaS: it runs
+`rca relay` on `:8080`; set `RCA_RELAY_ANNOUNCE` to the public
+`/dns4/<host>/tcp/443/tls/ws` and bind `RCA_RELAY_KEY` (a secret) for a stable
+PeerID.
+
 ## How it works
 
 ```
