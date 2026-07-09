@@ -3,6 +3,7 @@ module github.com/hoveychen/remote-cc-adapter
 go 1.25.7
 
 require (
+	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/multiformats/go-multiaddr v0.16.0
 )
