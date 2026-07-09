@@ -69,6 +69,7 @@ three rejected designs — is in [`docs/design.md`](docs/design.md) §2.
 | [`cmd/remote-cc-adapter`](cmd/remote-cc-adapter) | Brain-side host: spawns `claude` injected, serves IO-RPC, routes ops. |
 | [`cmd/rcc-executor`](cmd/rcc-executor) | Remote sidecar: runs fs ops + subprocesses on the sandbox host. |
 | [`cmd/rcc-spawn-proxy`](cmd/rcc-spawn-proxy) | Stands in for a routed subprocess; streams it from the executor. |
+| [`cmd/rcc-fuse`](cmd/rcc-fuse) | Linux: FUSE daemon backing injected fds with lazy slices (`internal/linuxfuse`). |
 | [`internal/protocol`](internal/protocol) | Binary fs IO-RPC wire format (shared C↔Go↔Go). |
 | [`internal/execproto`](internal/execproto) | Streaming subprocess protocol (proxy↔executor). |
 | [`internal/routing`](internal/routing) | Path routing table (remote-allowlist / default-remote). |
@@ -203,6 +204,14 @@ locally — the adapter never routes a user's global config to the sandbox.
   exec bridge splices the spawn proxy's local unix connection to a libp2p stream,
   so a command runs on a libp2p-remote executor end-to-end. The bridge is also
   in-path co-located and does not disturb the real-claude Bash e2e.
+- **Linux lazy slicing over FUSE** (`internal/linuxfuse`, `cmd/rcc-fuse`,
+  `native/linux`; verified in a privileged container by `scripts/linux-fuse-test.sh`):
+  the seccomp supervisor redirects a routed `openat` to a FUSE-backed file served
+  by `rcc-fuse`, which fetches each read as an on-demand slice from the adapter.
+  A raw consumer reads a 25-byte slice at 5 MiB of a 10 MiB routed file through
+  the full FUSE → adapter → executor chain and only **4096 bytes** cross the
+  fs-RPC — no whole-file materialisation, and the target's other reads are
+  untouched (design doc §4.1.3 / §4.3).
 
 **Subprocess routing (macOS)** decides remote-vs-local per spawn, highest
 precedence first: rg-mode self-invocation under a remote cwd → local-binary
@@ -222,9 +231,6 @@ children run with the injection environment stripped (no re-injection), and with
   against the cwd destabilises claude's boot. Needs a safer cwd-scoped policy
   (design doc §4.3).
 
-- Linux **lazy slicing**: today the supervisor fetches whole routed files into a
-  memfd because seccomp only traps `openat`; slicing needs trapping
-  `read`/`lseek` too or a FUSE backing store (design doc §4.1.3, §4.3).
 - `run_in_background` detach-poll semantics for backgrounded `Bash` (design doc
   §4.3).
 

@@ -53,13 +53,15 @@ func main() {
 		resign       = flag.Bool("resign", false, "on macOS, copy+ad-hoc-resign claude so the dylib can load, and run the copy")
 		printCmd     = flag.Bool("print-cmd", false, "print the claude launch command and exit (no spawn)")
 		workDir      = flag.String("workdir", "", "claude working directory (point under a remote prefix for natural cwd routing)")
+		fuseMnt      = flag.String("fuse-mount", "", "Linux: rcc-fuse mount point the seccomp supervisor redirects routed opens to (required on Linux)")
+		serveFSOnly  = flag.Bool("serve-fs-only", false, "start only the brain-side fs-RPC server + exec bridge (do not spawn claude); useful when the interceptor/FUSE client is launched separately")
 	)
 	var remotePrefixes, localPrefixes stringList
 	flag.Var(&remotePrefixes, "remote-prefix", "path prefix routed to the remote executor (repeatable)")
 	flag.Var(&localPrefixes, "local-prefix", "path prefix kept local under -default-remote (repeatable)")
 	flag.Parse()
 
-	if *claudePath == "" || *spawnProxy == "" {
+	if !*serveFSOnly && (*claudePath == "" || *spawnProxy == "") {
 		log.Fatal("remote-cc-adapter: --claude and --spawn-proxy are required")
 	}
 	if (*executorSock == "") == (*peerAddr == "") {
@@ -92,31 +94,6 @@ func main() {
 	// This is what lets subprocesses route cross-machine without the proxy
 	// speaking libp2p itself.
 	bridgeSock := *adapterSock + ".exec"
-
-	cfg := &adapter.LaunchConfig{
-		ClaudePath:     claudeToRun,
-		Args:           flag.Args(),
-		WorkDir:        *workDir,
-		AdapterSock:    *adapterSock,
-		ExecutorSock:   bridgeSock,
-		SpawnProxyPath: *spawnProxy,
-		RemotePrefixes: route.RemotePrefixes(),
-		SpawnSentinel:  *sentinel,
-		DylibPath:      *dylibPath,
-		SupervisorPath: *supervisor,
-	}
-	cmd, err := cfg.BuildCommand()
-	if err != nil {
-		log.Fatalf("remote-cc-adapter: %v", err)
-	}
-
-	if *printCmd {
-		fmt.Println(strings.Join(cmd.Args, " "))
-		for _, kv := range injectedEnv(cfg) {
-			fmt.Println("env:", kv)
-		}
-		return
-	}
 
 	// Build the executor-facing transport: unix socket (co-located) or libp2p.
 	var dialer transport.Dialer
@@ -166,6 +143,42 @@ func main() {
 		}
 	}()
 
+	// serve-fs-only: run the brain-side services and block (claude/interceptor
+	// launched separately, e.g. the Linux FUSE client or an external harness).
+	if *serveFSOnly {
+		logger.Printf("serving fs-RPC on %s and exec bridge on %s (no claude spawn)", *adapterSock, bridgeSock)
+		sigc := make(chan os.Signal, 2)
+		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+		<-sigc
+		return
+	}
+
+	// Build and spawn the intercepted claude process.
+	cfg := &adapter.LaunchConfig{
+		ClaudePath:     claudeToRun,
+		Args:           flag.Args(),
+		WorkDir:        *workDir,
+		AdapterSock:    *adapterSock,
+		ExecutorSock:   bridgeSock,
+		SpawnProxyPath: *spawnProxy,
+		RemotePrefixes: route.RemotePrefixes(),
+		SpawnSentinel:  *sentinel,
+		DylibPath:      *dylibPath,
+		SupervisorPath: *supervisor,
+		FuseMnt:        *fuseMnt,
+	}
+	cmd, err := cfg.BuildCommand()
+	if err != nil {
+		log.Fatalf("remote-cc-adapter: %v", err)
+	}
+	if *printCmd {
+		fmt.Println(strings.Join(cmd.Args, " "))
+		for _, kv := range injectedEnv(cfg) {
+			fmt.Println("env:", kv)
+		}
+		return
+	}
+
 	// Forward termination signals to claude.
 	sigc := make(chan os.Signal, 4)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
@@ -179,8 +192,7 @@ func main() {
 			}
 		}
 	}()
-	err = cmd.Wait()
-	os.Exit(exitCode(err))
+	os.Exit(exitCode(cmd.Wait()))
 }
 
 func defaultAdapterSock() string {

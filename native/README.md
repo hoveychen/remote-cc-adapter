@@ -52,11 +52,15 @@ table (and the executor's per-stream one) stay valid across the sequence.
 - **macOS requires a re-signed claude.** `DYLD_INSERT_LIBRARIES` is ignored for a
   hardened-runtime binary, so the adapter runs an ad-hoc re-signed *copy*
   (`--resign`); the original install is never touched (design doc §4.2).
-- **Linux fetches whole files, not slices (current limitation).** seccomp only
-  traps `openat`; the injected fd's later `read`/`lseek` are real syscalls we no
-  longer see, so `rcc_seccomp` fetches the whole routed file into a memfd up
-  front. Lazy slicing needs trapping `read`/`lseek` too or a FUSE backing store —
-  future work (design doc §4.1.3 step 2, §4.3).
-- **Linux needs privilege.** `NEW_LISTENER` + `ADDFD` require `CAP_SYS_ADMIN` or a
-  user-namespace setup; the POC used `--privileged --security-opt
-  seccomp=unconfined` (design doc §4.1.3).
+- **Linux lazy-slices reads via FUSE.** seccomp only traps `openat`; the injected
+  fd's later `read`/`lseek` are real syscalls the supervisor never sees. So the
+  supervisor redirects a routed `openat` to a FUSE-backed file under
+  `RCC_FUSE_MNT` (served by `cmd/rcc-fuse`), and the kernel routes that file's
+  reads to the FUSE daemon, which fetches each read as an on-demand slice from the
+  adapter. Only files opened through the mount incur FUSE callbacks, so the
+  target's other I/O is untouched (design doc §4.1.3 step 2, §4.3). Verified by
+  `scripts/linux-fuse-test.sh`.
+- **Linux needs privilege + FUSE.** `NEW_LISTENER` + `ADDFD` require
+  `CAP_SYS_ADMIN` or a user-namespace setup, and the FUSE mount needs `/dev/fuse`
+  + `fusermount3`; the tests use `--privileged --device /dev/fuse` (design doc
+  §4.1.3).
