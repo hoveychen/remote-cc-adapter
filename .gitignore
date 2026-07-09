@@ -31,3 +31,4 @@ TASKS.md
 # Go
 /vendor/
 dist/
+native/linux/rcc_seccomp
