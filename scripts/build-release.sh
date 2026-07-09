@@ -24,13 +24,19 @@ EMBED="$REPO/cmd/rca/embedded"
 LDFLAGS="-s -w -X main.version=$VERSION"
 mkdir -p "$DIST"
 
+# go:embed picks up EVERYTHING in embedded/ — drop stale artifacts (e.g. the
+# other platform's, from a previous local build) so archives stay minimal.
+rm -f "$EMBED/rcc_interpose.dylib" "$EMBED/rcc_seccomp"
+
 # Archive names carry no version (rca_darwin_arm64.tar.gz) so install
 # one-liners can use GitHub's releases/latest/download/ URLs; the version is
 # stamped inside the binary (`rca version`) and on the release tag.
 build_go() { # $1=goos $2=goarch
   local out="$DIST/rca"
   rm -f "$out"
-  CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -trimpath -ldflags "$LDFLAGS" -o "$out" ./cmd/rca
+  # -buildvcs=false: version comes from ldflags; VCS stamping would fail in
+  # containers/worktrees where .git isn't fully visible.
+  CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$out" ./cmd/rca
   local tarball="$DIST/rca_$1_$2.tar.gz"
   tar -C "$DIST" -czf "$tarball" rca
   rm -f "$out"
