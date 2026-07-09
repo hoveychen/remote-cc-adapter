@@ -190,6 +190,11 @@ func (d *Libp2pDialer) Dial(ctx context.Context) (Stream, error) {
 			return nil, fmt.Errorf("transport: connect peer: %w", err)
 		}
 	}
+	// Allow the stream to ride a limited (circuit-relay) connection. DCUtR still
+	// tries to upgrade to a direct connection first; without this, opening a
+	// stream over a relay-only peer blocks until the hole-punch succeeds and
+	// fails if it can't — defeating the relay fallback.
+	ctx = network.WithAllowLimitedConn(ctx, "rcc")
 	s, err := d.h.NewStream(ctx, d.peer.ID, RCCProtocol)
 	if err != nil {
 		return nil, fmt.Errorf("transport: open stream: %w", err)
