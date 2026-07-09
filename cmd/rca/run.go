@@ -487,6 +487,8 @@ func resolvePrefixes(in []string) []string {
 	return out
 }
 
+// injectedEnv mirrors the env LaunchConfig.BuildCommand sets, for --print-cmd
+// display. Keep it in sync with launch.go so the printed command is accurate.
 func injectedEnv(cfg *adapter.LaunchConfig) []string {
 	env := []string{
 		adapter.EnvAdapterSock + "=" + cfg.AdapterSock,
@@ -494,9 +496,16 @@ func injectedEnv(cfg *adapter.LaunchConfig) []string {
 		adapter.EnvSpawnProxy + "=" + cfg.SpawnProxyPath,
 		adapter.EnvRemotePrefix + "=" + strings.Join(cfg.RemotePrefixes, ":"),
 		adapter.EnvSpawnSentinel + "=" + cfg.SpawnSentinel,
+		adapter.EnvClaudePath + "=" + cfg.ClaudePath,
 	}
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		env = append(env, adapter.EnvDylib+"="+cfg.DylibPath)
+	case "linux":
+		// The seccomp+ptrace supervisor reads RCC_FUSE_MNT for the openat
+		// redirect; subprocess routing reads the RCC_SPAWN_PROXY/EXECUTOR_SOCK
+		// above. RCC_CLAUDE_PATH keeps the target itself (and its re-spawns) local.
+		env = append(env, adapter.EnvFuseMnt+"="+cfg.FuseMnt)
 	}
 	return env
 }
