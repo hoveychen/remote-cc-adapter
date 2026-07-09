@@ -468,10 +468,16 @@ int my_gde64(int fd, void *buf, size_t nbytes, long *basep) {
 // remote: keychain access (credentials live on the brain host), the spawn proxy
 // itself (avoid an infinite loop), and claude re-spawning itself (subagents run
 // in-process; a spawned claude helper still needs the brain-local adapter
-// socket + credentials). Extend via RCC_LOCAL_BINS (':'-joined substrings).
+// socket + credentials). Also user-facing terminal tools that act on the
+// operator's local session, not the project: pbcopy writes the local clipboard
+// (see claude's ink/termio/osc.ts — "always work locally"), and tmux drives the
+// operator's local terminal panes (multi-agent orchestration). Routing these to
+// the remote executor would target the wrong machine's clipboard/terminal.
+// Extend via RCC_LOCAL_BINS (':'-joined substrings).
 static int spawn_is_local_bin(const char *path) {
   if (!path) return 0;
-  static const char *defaults[] = {"/usr/bin/security", "rcc-spawn-proxy", NULL};
+  static const char *defaults[] = {"/usr/bin/security", "rcc-spawn-proxy",
+                                    "pbcopy", "tmux", NULL};
   for (int i = 0; defaults[i]; i++)
     if (strstr(path, defaults[i])) return 1;
   const char *claude = getenv("RCC_CLAUDE_PATH");
