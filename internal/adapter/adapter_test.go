@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -106,6 +107,38 @@ func TestAdapterRoutesLocalAndRemote(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(outPath); string(got) != "hi remote" {
 		t.Fatalf("remote write not landed: %q", got)
+	}
+
+	// 5. create + pwrite on a remote-routed path: the FUSE mount's write path.
+	newPath := filepath.Join(remoteDir, "created.txt")
+	must(t, conn.SendRequest(&protocol.Request{Op: protocol.OpCreate, Path: newPath,
+		Flags: uint32(os.O_RDWR), Mode: 0o644}))
+	cr, err := conn.ReadResponse(protocol.OpCreate)
+	if err != nil || cr.Err != 0 {
+		t.Fatalf("remote create: err=%v resp=%+v", err, cr)
+	}
+	must(t, conn.SendRequest(&protocol.Request{Op: protocol.OpPwrite, Handle: cr.Handle, Off: 0, Data: []byte("pwritten")}))
+	if pw, err := conn.ReadResponse(protocol.OpPwrite); err != nil || pw.Err != 0 || pw.Size != 8 {
+		t.Fatalf("remote pwrite: err=%v resp=%+v", err, pw)
+	}
+	must(t, conn.SendRequest(&protocol.Request{Op: protocol.OpClose, Handle: cr.Handle}))
+	if _, err := conn.ReadResponse(protocol.OpClose); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(newPath); string(got) != "pwritten" {
+		t.Fatalf("remote pwrite not landed: %q", got)
+	}
+
+	// 6. a rename that would straddle the routing boundary is EXDEV, not a
+	// silent half-move. Callers fall back to copy+unlink on EXDEV.
+	must(t, conn.SendRequest(&protocol.Request{Op: protocol.OpRename, Path: newPath,
+		Path2: filepath.Join(localDir, "moved.txt")}))
+	rn, err := conn.ReadResponse(protocol.OpRename)
+	if err != nil || rn.Err != -int32(syscall.EXDEV) {
+		t.Fatalf("cross-boundary rename: err=%v resp=%+v, want EXDEV", err, rn)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("source vanished on a refused rename: %v", err)
 	}
 }
 

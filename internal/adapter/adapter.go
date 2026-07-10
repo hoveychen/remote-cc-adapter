@@ -104,15 +104,29 @@ type session struct {
 
 func (s *session) handle(req *protocol.Request) *protocol.Response {
 	switch req.Op {
-	case protocol.OpStat, protocol.OpReaddir, protocol.OpWriteFile:
+	case protocol.OpStat, protocol.OpReaddir, protocol.OpWriteFile,
+		protocol.OpUnlink, protocol.OpMkdir, protocol.OpSetattr:
 		return s.forwardByPath(req)
-	case protocol.OpOpen:
+	case protocol.OpRename:
+		return s.rename(req)
+	case protocol.OpOpen, protocol.OpCreate:
 		return s.open(req)
-	case protocol.OpPread, protocol.OpClose:
+	case protocol.OpPread, protocol.OpPwrite, protocol.OpClose:
 		return s.byHandle(req)
 	default:
 		return &protocol.Response{Err: -int32(syscall.EINVAL)}
 	}
+}
+
+// rename refuses to cross the routing boundary. Both endpoints must live on the
+// same side; a rename that would move a file between the brain host and the
+// executor is a cross-device link as far as the caller is concerned, and EXDEV
+// is what makes callers fall back to copy+unlink.
+func (s *session) rename(req *protocol.Request) *protocol.Response {
+	if s.adapter.route.IsRemote(req.Path) != s.adapter.route.IsRemote(req.Path2) {
+		return &protocol.Response{Err: -int32(syscall.EXDEV)}
+	}
+	return s.forwardByPath(req)
 }
 
 // forwardByPath routes path-addressed ops with no handle bookkeeping.

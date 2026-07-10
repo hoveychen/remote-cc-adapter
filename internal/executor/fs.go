@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hoveychen/remote-cc-adapter/internal/protocol"
 )
@@ -44,6 +45,18 @@ func (s *FSService) Handle(req *protocol.Request) *protocol.Response {
 		return s.close(req)
 	case protocol.OpReaddir:
 		return s.readdir(req)
+	case protocol.OpPwrite:
+		return s.pwrite(req)
+	case protocol.OpCreate:
+		return s.create(req)
+	case protocol.OpUnlink:
+		return s.unlink(req)
+	case protocol.OpMkdir:
+		return s.mkdir(req)
+	case protocol.OpRename:
+		return s.rename(req)
+	case protocol.OpSetattr:
+		return s.setattr(req)
 	default:
 		return &protocol.Response{Err: -int32(syscall.EINVAL)}
 	}
@@ -55,11 +68,21 @@ func (s *FSService) stat(req *protocol.Request) *protocol.Response {
 		return &protocol.Response{Err: toErrno(err)}
 	}
 	s.logf("STAT %s size=%d dir=%v", req.Path, fi.Size(), fi.IsDir())
-	return &protocol.Response{Mode: fileMode(fi), Size: fi.Size()}
+	return &protocol.Response{Mode: fileMode(fi), Size: fi.Size(), Mtime: fi.ModTime().UnixNano()}
 }
 
 func (s *FSService) openFile(req *protocol.Request) *protocol.Response {
-	f, err := os.OpenFile(req.Path, int(req.Flags), 0o644)
+	return s.openWithMode(req, int(req.Flags), 0o644)
+}
+
+// create opens req.Path with an explicit permission mode. Unlike OpOpen it
+// always implies O_CREAT, so the FUSE Create path never races an existing file.
+func (s *FSService) create(req *protocol.Request) *protocol.Response {
+	return s.openWithMode(req, int(req.Flags)|os.O_CREATE, os.FileMode(req.Mode).Perm())
+}
+
+func (s *FSService) openWithMode(req *protocol.Request, flags int, perm os.FileMode) *protocol.Response {
+	f, err := os.OpenFile(req.Path, flags, perm)
 	if err != nil {
 		return &protocol.Response{Err: toErrno(err)}
 	}
@@ -73,8 +96,84 @@ func (s *FSService) openFile(req *protocol.Request) *protocol.Response {
 	s.next++
 	s.open[h] = f
 	s.mu.Unlock()
-	s.logf("OPEN %s -> handle=%d size=%d", req.Path, h, fi.Size())
-	return &protocol.Response{Mode: fileMode(fi), Size: fi.Size(), Handle: h}
+	s.logf("%s %s -> handle=%d size=%d", req.Op, req.Path, h, fi.Size())
+	return &protocol.Response{Mode: fileMode(fi), Size: fi.Size(), Handle: h, Mtime: fi.ModTime().UnixNano()}
+}
+
+func (s *FSService) pwrite(req *protocol.Request) *protocol.Response {
+	s.mu.Lock()
+	f := s.open[req.Handle]
+	s.mu.Unlock()
+	if f == nil {
+		return &protocol.Response{Err: -int32(syscall.EBADF)}
+	}
+	n, err := f.WriteAt(req.Data, req.Off)
+	if err != nil {
+		return &protocol.Response{Err: toErrno(err)}
+	}
+	s.logf("PWRITE handle=%d off=%d -> %d", req.Handle, req.Off, n)
+	return &protocol.Response{Size: int64(n)}
+}
+
+// unlink removes a file, or a directory when Flags carries UnlinkRmdir. The two
+// use distinct syscalls so the caller gets POSIX's distinct errnos (EISDIR /
+// ENOTDIR) rather than os.Remove's unified behaviour.
+func (s *FSService) unlink(req *protocol.Request) *protocol.Response {
+	var err error
+	if req.Flags&protocol.UnlinkRmdir != 0 {
+		err = syscall.Rmdir(req.Path)
+	} else {
+		err = syscall.Unlink(req.Path)
+	}
+	if err != nil {
+		return &protocol.Response{Err: toErrno(err)}
+	}
+	s.logf("UNLINK %s rmdir=%v", req.Path, req.Flags&protocol.UnlinkRmdir != 0)
+	return &protocol.Response{}
+}
+
+func (s *FSService) mkdir(req *protocol.Request) *protocol.Response {
+	if err := os.Mkdir(req.Path, os.FileMode(req.Mode).Perm()); err != nil {
+		return &protocol.Response{Err: toErrno(err)}
+	}
+	s.logf("MKDIR %s", req.Path)
+	return &protocol.Response{}
+}
+
+func (s *FSService) rename(req *protocol.Request) *protocol.Response {
+	if err := os.Rename(req.Path, req.Path2); err != nil {
+		return &protocol.Response{Err: toErrno(err)}
+	}
+	s.logf("RENAME %s -> %s", req.Path, req.Path2)
+	return &protocol.Response{}
+}
+
+func (s *FSService) setattr(req *protocol.Request) *protocol.Response {
+	if req.Mask&protocol.SetMode != 0 {
+		if err := os.Chmod(req.Path, os.FileMode(req.Mode).Perm()); err != nil {
+			return &protocol.Response{Err: toErrno(err)}
+		}
+	}
+	if req.Mask&protocol.SetSize != 0 {
+		if err := os.Truncate(req.Path, req.Size); err != nil {
+			return &protocol.Response{Err: toErrno(err)}
+		}
+	}
+	// Chtimes needs both stamps; a zero time leaves that stamp untouched.
+	if req.Mask&(protocol.SetAtime|protocol.SetMtime) != 0 {
+		var at, mt time.Time
+		if req.Mask&protocol.SetAtime != 0 {
+			at = time.Unix(0, req.Atime)
+		}
+		if req.Mask&protocol.SetMtime != 0 {
+			mt = time.Unix(0, req.Mtime)
+		}
+		if err := os.Chtimes(req.Path, at, mt); err != nil {
+			return &protocol.Response{Err: toErrno(err)}
+		}
+	}
+	s.logf("SETATTR %s mask=%#x", req.Path, req.Mask)
+	return &protocol.Response{}
 }
 
 func (s *FSService) pread(req *protocol.Request) *protocol.Response {

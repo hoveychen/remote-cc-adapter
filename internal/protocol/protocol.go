@@ -41,6 +41,30 @@ const (
 	OpWriteFile Op = 4 // write a whole file body (interceptor buffers, flushes on close)
 	OpClose     Op = 5 // release a handle
 	OpReaddir   Op = 6 // list directory entries
+
+	// Ops 7..12 back the Linux FUSE mount's write path. The macOS interposer
+	// never sends them: it buffers a whole file and flushes it with OpWriteFile
+	// on close, because it cannot see a partial write. A FUSE mount can, so it
+	// speaks real POSIX mutations instead.
+	OpPwrite  Op = 7  // positional write to a handle
+	OpCreate  Op = 8  // create+open a path with an explicit mode
+	OpUnlink  Op = 9  // remove a file (Flags&UnlinkRmdir removes a directory)
+	OpMkdir   Op = 10 // create a directory
+	OpRename  Op = 11 // rename Path -> Path2
+	OpSetattr Op = 12 // change mode/size/times per Mask
+)
+
+// UnlinkRmdir makes OpUnlink remove a directory instead of a file. The two are
+// distinct syscalls with distinct errnos (unlink of a directory is EISDIR,
+// rmdir of a file is ENOTDIR) and FUSE relies on the difference.
+const UnlinkRmdir uint32 = 1
+
+// Mask bits selecting which OpSetattr fields are meaningful.
+const (
+	SetMode  uint32 = 1 << 0
+	SetSize  uint32 = 1 << 1
+	SetAtime uint32 = 1 << 2
+	SetMtime uint32 = 1 << 3
 )
 
 // String renders an Op for logs.
@@ -58,6 +82,18 @@ func (o Op) String() string {
 		return "CLOSE"
 	case OpReaddir:
 		return "READDIR"
+	case OpPwrite:
+		return "PWRITE"
+	case OpCreate:
+		return "CREATE"
+	case OpUnlink:
+		return "UNLINK"
+	case OpMkdir:
+		return "MKDIR"
+	case OpRename:
+		return "RENAME"
+	case OpSetattr:
+		return "SETATTR"
 	default:
 		return fmt.Sprintf("OP(%d)", uint8(o))
 	}
@@ -69,20 +105,27 @@ const MaxFrame = 64 << 20 // 64 MiB
 // Request is a decoded IO-RPC request. Only the fields relevant to Op are set.
 type Request struct {
 	Op     Op
-	Path   string // OpStat, OpOpen, OpWriteFile, OpReaddir
-	Flags  uint32 // OpOpen: POSIX open flags
-	Handle uint64 // OpPread, OpClose
-	Off    int64  // OpPread
+	Path   string // OpStat, OpOpen, OpWriteFile, OpReaddir, OpCreate, OpUnlink, OpMkdir, OpRename, OpSetattr
+	Path2  string // OpRename: destination
+	Flags  uint32 // OpOpen/OpCreate: POSIX open flags; OpUnlink: UnlinkRmdir
+	Mode   uint32 // OpCreate/OpMkdir: permission bits; OpSetattr: new mode
+	Mask   uint32 // OpSetattr: which of Mode/Size/Atime/Mtime apply
+	Handle uint64 // OpPread, OpPwrite, OpClose
+	Off    int64  // OpPread, OpPwrite
 	Len    uint32 // OpPread: requested length
-	Data   []byte // OpWriteFile: file body
+	Size   int64  // OpSetattr: new size
+	Atime  int64  // OpSetattr: access time, Unix nanoseconds
+	Mtime  int64  // OpSetattr: modification time, Unix nanoseconds
+	Data   []byte // OpWriteFile: file body; OpPwrite: bytes to write
 }
 
 // Response is a decoded IO-RPC response. errno 0 means success.
 type Response struct {
 	Err    int32    // 0 ok, else negative POSIX errno
-	Mode   uint32   // OpStat/OpOpen: st_mode
-	Size   int64    // OpStat/OpOpen: file size
-	Handle uint64   // OpOpen: opaque handle
+	Mode   uint32   // OpStat/OpOpen/OpCreate: st_mode
+	Size   int64    // OpStat/OpOpen/OpCreate: file size; OpPwrite: bytes written
+	Handle uint64   // OpOpen/OpCreate: opaque handle
+	Mtime  int64    // OpStat/OpOpen/OpCreate: st_mtime, Unix nanoseconds
 	Data   []byte   // OpPread: bytes read
 	Names  []string // OpReaddir: entry names
 	Types  []uint8  // OpReaddir: per-entry POSIX d_type (parallel to Names)
@@ -190,6 +233,15 @@ func (p *parser) u64() uint64 {
 }
 func (p *parser) i32() int32 { return int32(p.u32()) }
 func (p *parser) i64() int64 { return int64(p.u64()) }
+
+// left reports how many bytes remain unparsed, so an optional trailing field can
+// be read only when the peer actually sent it.
+func (p *parser) left() int {
+	if p.err != nil {
+		return 0
+	}
+	return len(p.b)
+}
 func (p *parser) bytes() []byte {
 	n := p.u32()
 	if p.err != nil || uint32(len(p.b)) < n {
@@ -223,6 +275,30 @@ func WriteRequest(w io.Writer, req *Request) error {
 		e.bytes(req.Data)
 	case OpClose:
 		e.u64(req.Handle)
+	case OpPwrite:
+		e.u64(req.Handle)
+		e.i64(req.Off)
+		e.bytes(req.Data)
+	case OpCreate:
+		e.str(req.Path)
+		e.u32(req.Flags)
+		e.u32(req.Mode)
+	case OpUnlink:
+		e.str(req.Path)
+		e.u32(req.Flags)
+	case OpMkdir:
+		e.str(req.Path)
+		e.u32(req.Mode)
+	case OpRename:
+		e.str(req.Path)
+		e.str(req.Path2)
+	case OpSetattr:
+		e.str(req.Path)
+		e.u32(req.Mask)
+		e.u32(req.Mode)
+		e.i64(req.Size)
+		e.i64(req.Atime)
+		e.i64(req.Mtime)
 	default:
 		return fmt.Errorf("protocol: unknown request op %d", req.Op)
 	}
@@ -252,6 +328,30 @@ func ReadRequest(r io.Reader) (*Request, error) {
 		req.Data = p.bytes()
 	case OpClose:
 		req.Handle = p.u64()
+	case OpPwrite:
+		req.Handle = p.u64()
+		req.Off = p.i64()
+		req.Data = p.bytes()
+	case OpCreate:
+		req.Path = p.str()
+		req.Flags = p.u32()
+		req.Mode = p.u32()
+	case OpUnlink:
+		req.Path = p.str()
+		req.Flags = p.u32()
+	case OpMkdir:
+		req.Path = p.str()
+		req.Mode = p.u32()
+	case OpRename:
+		req.Path = p.str()
+		req.Path2 = p.str()
+	case OpSetattr:
+		req.Path = p.str()
+		req.Mask = p.u32()
+		req.Mode = p.u32()
+		req.Size = p.i64()
+		req.Atime = p.i64()
+		req.Mtime = p.i64()
 	default:
 		return nil, fmt.Errorf("protocol: unknown request op %d", req.Op)
 	}
@@ -270,14 +370,19 @@ func WriteResponse(w io.Writer, op Op, resp *Response) error {
 	e.i32(resp.Err)
 	if resp.Err == 0 {
 		switch op {
-		case OpStat, OpOpen:
+		case OpStat, OpOpen, OpCreate:
 			e.u32(resp.Mode)
 			e.i64(resp.Size)
-			if op == OpOpen {
+			if op != OpStat {
 				e.u64(resp.Handle)
 			}
+			// Mtime is appended last so the macOS interposer, which parses the
+			// fields it knows off a cursor and ignores the tail, keeps working.
+			e.i64(resp.Mtime)
 		case OpPread:
 			e.bytes(resp.Data)
+		case OpPwrite:
+			e.i64(resp.Size) // bytes written
 		case OpReaddir:
 			e.u32(uint32(len(resp.Names)))
 			for i, n := range resp.Names {
@@ -288,7 +393,7 @@ func WriteResponse(w io.Writer, op Op, resp *Response) error {
 				}
 				e.u8(t)
 			}
-		case OpWriteFile, OpClose:
+		case OpWriteFile, OpClose, OpUnlink, OpMkdir, OpRename, OpSetattr:
 			// errno only
 		}
 	}
@@ -305,14 +410,20 @@ func ReadResponse(r io.Reader, op Op) (*Response, error) {
 	resp := &Response{Err: p.i32()}
 	if resp.Err == 0 {
 		switch op {
-		case OpStat, OpOpen:
+		case OpStat, OpOpen, OpCreate:
 			resp.Mode = p.u32()
 			resp.Size = p.i64()
-			if op == OpOpen {
+			if op != OpStat {
 				resp.Handle = p.u64()
+			}
+			// Optional: a peer built before Mtime existed sends nothing here.
+			if p.left() >= 8 {
+				resp.Mtime = p.i64()
 			}
 		case OpPread:
 			resp.Data = p.bytes()
+		case OpPwrite:
+			resp.Size = p.i64()
 		case OpReaddir:
 			n := p.u32()
 			resp.Names = make([]string, 0, n)
@@ -321,7 +432,7 @@ func ReadResponse(r io.Reader, op Op) (*Response, error) {
 				resp.Names = append(resp.Names, p.str())
 				resp.Types = append(resp.Types, p.u8())
 			}
-		case OpWriteFile, OpClose:
+		case OpWriteFile, OpClose, OpUnlink, OpMkdir, OpRename, OpSetattr:
 		}
 	}
 	if p.err != nil {
