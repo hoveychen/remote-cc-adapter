@@ -406,7 +406,11 @@ int main(int argc, char **argv) {
       } else if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
         ptrace(PTRACE_CONT, w, 0, 0);   // group-stop: resume, don't reinject
       } else {
-        ptrace(PTRACE_CONT, w, sig, 0); // signal-delivery-stop: reinject
+        // signal-delivery-stop: reinject. The signal goes in ptrace's DATA (4th)
+        // argument; addr is ignored for PTRACE_CONT. Passing it as addr (3rd) —
+        // as this line used to — delivered signal 0, i.e. silently dropped every
+        // reinjected signal, which wedged JSC's SIGPWR stop-the-world GC.
+        ptrace(PTRACE_CONT, w, 0, (void *)(long)sig);
       }
     }
   }
