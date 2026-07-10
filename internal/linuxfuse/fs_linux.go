@@ -17,6 +17,7 @@ package linuxfuse
 import (
 	"context"
 	"encoding/hex"
+	pathpkg "path"
 	"sync"
 	"syscall"
 
@@ -104,14 +105,80 @@ func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 	if !ok {
 		return nil, syscall.ENOENT
 	}
-	resp := r.client.call(&protocol.Request{Op: protocol.OpStat, Path: path})
+	return newNode(ctx, &r.Inode, r.client, path, out)
+}
+
+// newNode stats path and materialises the matching node. A routed path may be a
+// directory — a remote cwd is the common case — so the node type must follow
+// st_mode. Typing a directory S_IFREG makes the supervisor inject a regular-file
+// fd for its openat, and the caller's getdents64 then fails ENOTDIR.
+func newNode(ctx context.Context, parent *fs.Inode, c *Client, path string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	resp := c.call(&protocol.Request{Op: protocol.OpStat, Path: path})
 	if resp.Err != 0 {
 		return nil, syscall.Errno(-resp.Err)
 	}
+	if resp.IsDir() {
+		out.Attr.Mode = fuse.S_IFDIR | 0o755
+		child := &dirNode{client: c, path: path}
+		return parent.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR}), 0
+	}
 	out.Attr.Mode = fuse.S_IFREG | 0o644
 	out.Attr.Size = uint64(resp.Size)
-	child := &fileNode{client: r.client, path: path, size: resp.Size}
-	return r.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG}), 0
+	child := &fileNode{client: c, path: path, size: resp.Size}
+	return parent.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG}), 0
+}
+
+// dirNode is one routed directory; Readdir forwards to the executor's OpReaddir.
+type dirNode struct {
+	fs.Inode
+	client *Client
+	path   string
+}
+
+var (
+	_ = fs.NodeGetattrer((*dirNode)(nil))
+	_ = fs.NodeReaddirer((*dirNode)(nil))
+	_ = fs.NodeLookuper((*dirNode)(nil))
+)
+
+func (d *dirNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.Mode = fuse.S_IFDIR | 0o755
+	return 0
+}
+
+func (d *dirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	resp := d.client.call(&protocol.Request{Op: protocol.OpReaddir, Path: d.path})
+	if resp.Err != 0 {
+		return nil, syscall.Errno(-resp.Err)
+	}
+	ents := make([]fuse.DirEntry, 0, len(resp.Names))
+	for i, n := range resp.Names {
+		var t uint8 = protocol.DTUnknown
+		if i < len(resp.Types) {
+			t = resp.Types[i]
+		}
+		ents = append(ents, fuse.DirEntry{Name: n, Mode: direntMode(t)})
+	}
+	return fs.NewListDirStream(ents), 0
+}
+
+func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	return newNode(ctx, &d.Inode, d.client, pathpkg.Join(d.path, name), out)
+}
+
+// direntMode maps a POSIX d_type to the file-type bits fuse.DirEntry expects.
+// Directories must be exact: ripgrep will not descend an entry typed DT_REG.
+func direntMode(t uint8) uint32 {
+	switch t {
+	case protocol.DTDir:
+		return syscall.S_IFDIR
+	case protocol.DTLnk:
+		return syscall.S_IFLNK
+	case protocol.DTReg:
+		return syscall.S_IFREG
+	default:
+		return 0
+	}
 }
 
 // fileNode is one routed file; reads fetch slices lazily.

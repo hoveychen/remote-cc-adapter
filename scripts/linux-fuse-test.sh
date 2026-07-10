@@ -30,6 +30,10 @@ echo "== stage 10MiB file with a marker at offset 5MiB =="
 dd if=/dev/zero of="$BIG" bs=1M count=10 status=none
 printf '%s' "$MARK" | dd of="$BIG" bs=1 seek=$((5*1024*1024)) conv=notrunc status=none
 
+echo "== stage a routed directory (openat O_DIRECTORY + getdents64 must work) =="
+DIR="$STORE/listme"; mkdir -p "$DIR/nested"
+: > "$DIR/alpha.txt"; : > "$DIR/beta.txt"
+
 echo "== start executor (remote side, backs the file) =="
 "$WORK/rca" serve --sock "$EXECSOCK" >"$WORK/exec.log" 2>&1 &
 EXEC_PID=$!
@@ -67,6 +71,43 @@ cc -O2 -o "$WORK/consumer" "$WORK/consumer.c"
 OUT="$(RCC_FUSE_MNT="$MNT" RCC_REMOTE_PREFIXES="$STORE" "$WORK/sup" "$WORK/consumer" "$BIG" 2>"$WORK/sup.log" || true)"
 echo "consumer said: $OUT"
 
+echo "== raw consumer: openat routed DIRECTORY, getdents64 the entries =="
+cat > "$WORK/dirconsumer.c" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+struct linux_dirent64 {
+  unsigned long long d_ino, d_off;
+  unsigned short d_reclen;
+  unsigned char d_type;
+  char d_name[];
+};
+int main(int argc, char **argv) {
+  (void)argc;
+  int fd = syscall(SYS_openat, AT_FDCWD, argv[1], O_RDONLY | O_DIRECTORY, 0);
+  if (fd < 0) { perror("openat"); return 1; }
+  char buf[8192];
+  for (;;) {
+    long n = syscall(SYS_getdents64, fd, buf, sizeof buf);
+    if (n < 0) { perror("getdents64"); return 1; }
+    if (n == 0) break;
+    for (long o = 0; o < n;) {
+      struct linux_dirent64 *d = (struct linux_dirent64 *)(buf + o);
+      printf("ENT:%s type=%d\n", d->d_name, d->d_type);
+      o += d->d_reclen;
+    }
+  }
+  return 0;
+}
+EOF
+cc -O2 -o "$WORK/dirconsumer" "$WORK/dirconsumer.c"
+
+DIROUT="$(RCC_FUSE_MNT="$MNT" RCC_REMOTE_PREFIXES="$STORE" "$WORK/sup" "$WORK/dirconsumer" "$DIR" 2>&1 || true)"
+echo "dirconsumer said: $DIROUT"
+
 kill "$FUSE_PID" 2>/dev/null || true; fusermount3 -u "$MNT" 2>/dev/null || true
 kill "$AD_PID" 2>/dev/null || true
 kill "$EXEC_PID" 2>/dev/null || true
@@ -86,6 +127,19 @@ if [[ "$FETCHED" -gt 0 && "$FETCHED" -lt $((1024*1024)) ]]; then
   echo "[PASS] lazy: fetched ${FETCHED} bytes, far less than the 10MiB file"
 else
   echo "[FAIL] not lazy (fetched ${FETCHED} bytes)"; PASS=0
+fi
+# A routed directory must open as a directory and enumerate. Regression guard for
+# the FUSE layer typing every routed path S_IFREG, which made openat+getdents64
+# on a routed cwd fail ENOTDIR and wedged bun's opendir() at startup.
+if echo "$DIROUT" | grep -q "ENT:alpha.txt" && echo "$DIROUT" | grep -q "ENT:beta.txt"; then
+  echo "[PASS] routed directory enumerated via getdents64"
+else
+  echo "[FAIL] routed directory did not enumerate: $DIROUT"; PASS=0
+fi
+if echo "$DIROUT" | grep -q "ENT:nested type=4"; then
+  echo "[PASS] nested subdirectory reported d_type=DT_DIR"
+else
+  echo "[FAIL] nested subdirectory d_type wrong (ripgrep would not recurse)"; PASS=0
 fi
 echo "==================="
 rm -rf "$WORK"

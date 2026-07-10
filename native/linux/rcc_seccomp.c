@@ -162,9 +162,15 @@ static ssize_t read_mem(pid_t pid, unsigned long addr, void *out, size_t n) {
   return process_vm_readv(pid, &local, 1, &remote, 1, 0);
 }
 
-// read_cstr reads a NUL-terminated string from the tracee into a static buffer.
+// read_cstr reads a NUL-terminated string from the tracee into a per-thread
+// buffer. The buffer MUST be thread-local: the openat NOTIF thread holds the
+// returned pointer across is_remote() and open_fuse() (which blocks on a real
+// open() through the FUSE mount), while the tracer thread reads execve paths and
+// argv strings concurrently. A shared buffer let one clobber the other — visible
+// as EXEC log lines whose arg0 belonged to some other syscall, and able to make
+// open_fuse() open a different remote path than the one that was routed.
 static char *read_cstr(pid_t pid, unsigned long addr) {
-  static char b[4096];
+  static _Thread_local char b[4096];
   if (!addr) return NULL;
   char mm[64];
   snprintf(mm, sizeof mm, "/proc/%d/mem", pid);
@@ -178,8 +184,9 @@ static char *read_cstr(pid_t pid, unsigned long addr) {
   return b;
 }
 
-// The openat path buffer is separate from read_cstr's so an execve handler that
-// reads argv strings cannot clobber a path mid-notification.
+// read_path is read_cstr under the name the openat handler uses. Isolation from
+// the execve handler comes from read_cstr's buffer being thread-local, not from
+// a second buffer.
 static char *read_path(pid_t pid, unsigned long addr) { return read_cstr(pid, addr); }
 
 // ---- routing ---------------------------------------------------------------
@@ -379,7 +386,7 @@ static void rewrite_execve(pid_t pid) {
   const char *reason = "?";
   // Build a char** view of argv for the router (strings read on demand).
   char *avstr[MAX_ARGV];
-  static char argv_str_pool[MAX_ARGV][256];
+  static _Thread_local char argv_str_pool[MAX_ARGV][256];
   for (int i = 0; i < n; i++) {
     char *s = read_cstr(pid, orig_argv[i]);
     if (s) { strncpy(argv_str_pool[i], s, 255); argv_str_pool[i][255] = 0; avstr[i] = argv_str_pool[i]; }
