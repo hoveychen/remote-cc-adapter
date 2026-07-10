@@ -15,6 +15,7 @@ package linuxfuse
 
 import (
 	"context"
+	"hash/fnv"
 	"os"
 	pathpkg "path"
 	"sync"
@@ -110,6 +111,27 @@ func fillAttr(a *fuse.Attr, resp *protocol.Response) {
 	}
 }
 
+// stableAttr gives a routed path a permanent identity. go-fuse keys its inode
+// cache on StableAttr, and mints a fresh auto-incremented inode number for every
+// node whose Ino is left zero — so nodes built with Ino=0 are never
+// deduplicated, and each revalidation of a name (entry timeouts are zero here)
+// hands the kernel a brand-new inode. Callers that key on st_ino then never
+// converge: bun's fs.watch spins and claude deadlocks at startup on a routed
+// cwd. Hashing the remote path keeps one path pointing at one inode for the life
+// of the mount, which is the property those callers actually need. It is not the
+// executor's st_ino — the protocol carries no inode — so hard links look like
+// distinct files and a rename changes identity.
+func stableAttr(path string, mode uint32) fs.StableAttr {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(path))
+	ino := h.Sum64()
+	// 0 means "assign one for me", 1 is the mount root, ^0 is go-fuse's poll hack.
+	if ino <= 1 || ino == ^uint64(0) {
+		ino = 2
+	}
+	return fs.StableAttr{Mode: mode, Ino: ino, Gen: 1}
+}
+
 // newNode stats path and materialises the matching node. A routed path may be a
 // directory — a remote cwd is the common case — so the node type must follow
 // st_mode. Typing a directory S_IFREG makes getdents64 on it fail ENOTDIR.
@@ -121,10 +143,10 @@ func newNode(ctx context.Context, parent *fs.Inode, c *Client, path string, out 
 	fillAttr(&out.Attr, resp)
 	if resp.IsDir() {
 		child := &dirNode{client: c, path: path}
-		return parent.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR}), 0
+		return parent.NewInode(ctx, child, stableAttr(path, syscall.S_IFDIR)), 0
 	}
 	child := &fileNode{client: c, path: path}
-	return parent.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG}), 0
+	return parent.NewInode(ctx, child, stableAttr(path, syscall.S_IFREG)), 0
 }
 
 // getattr refreshes one node's attributes straight from the executor. Nothing is
@@ -223,7 +245,7 @@ func (d *dirNode) Create(ctx context.Context, name string, flags, mode uint32, o
 	}
 	fillAttr(&out.Attr, resp)
 	child := &fileNode{client: d.client, path: path}
-	inode := d.NewInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG})
+	inode := d.NewInode(ctx, child, stableAttr(path, syscall.S_IFREG))
 	return inode, &fileHandle{client: d.client, handle: resp.Handle}, 0, 0
 }
 

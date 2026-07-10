@@ -215,6 +215,42 @@ cc -O2 -o "$WORK/cwdconsumer" "$WORK/cwdconsumer.c"
 CWDOUT="$(nsrun "$STORE" "$WORK/sup" "$WORK/cwdconsumer" 2>&1 || true)"
 echo "cwdconsumer said: $CWDOUT"
 
+echo "== raw consumer: a routed path must keep one inode number across lookups =="
+# go-fuse hands out a fresh auto-incremented inode number for every Inode whose
+# StableAttr.Ino is zero, and its lookup cache is keyed on StableAttr — so a node
+# built with Ino=0 is never deduplicated and each revalidation of the same name
+# mints a new inode. Watchers and caches keyed on st_ino then never converge;
+# bun's fs.watch spins and claude wedges at startup on a routed cwd.
+cat > "$WORK/inoprobe.c" <<'EOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) {
+  (void)argc;
+  struct stat sb;
+  for (int i = 0; i < 3; i++) {
+    if (stat(argv[1], &sb) < 0) { perror("stat file"); return 1; }
+    printf("INO_FILE:%llu\n", (unsigned long long)sb.st_ino);
+  }
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) { perror("open"); return 1; }
+  struct stat fb;
+  if (fstat(fd, &fb) < 0) { perror("fstat"); return 1; }
+  printf("INO_FSTAT:%llu\n", (unsigned long long)fb.st_ino);
+  for (int i = 0; i < 3; i++) {
+    if (stat(argv[2], &sb) < 0) { perror("stat dir"); return 1; }
+    printf("INO_DIR:%llu\n", (unsigned long long)sb.st_ino);
+  }
+  return 0;
+}
+EOF
+cc -O2 -o "$WORK/inoprobe" "$WORK/inoprobe.c"
+
+INOOUT="$(nsrun "$WORK" "$WORK/sup" "$WORK/inoprobe" "$BIG" "$DIR" 2>&1 || true)"
+echo "inoprobe said: $(echo "$INOOUT" | tr '\n' ' ')"
+
 echo "== mutate the routed directory: create, write, truncate, mkdir, rename, remove =="
 # Exercises the FUSE write path (Create/Write/Setattr/Mkdir/Rename/Unlink/Rmdir)
 # with ordinary shell tools. Everything must land on the *serve* side, i.e. in
@@ -350,6 +386,18 @@ if echo "$CWDOUT" | grep -q "^CWD:$STORE$" && echo "$CWDOUT" | grep -q "^CWDENT:
   echo "[PASS] routed cwd enumerates and resolves relative names"
 else
   echo "[FAIL] routed cwd is not the remote directory: $(echo "$CWDOUT" | tr '\n' ' ')"; PASS=0
+fi
+# One routed path, one identity. Repeated stat(2) of the same name must report
+# the same st_ino, fstat must agree with stat, and a file must not share an inode
+# number with a directory.
+INO_FILES="$(echo "$INOOUT" | sed -n 's/^INO_FILE:\(.*\)/\1/p' | sort -u | tr '\n' ' ')"
+INO_DIRS="$(echo "$INOOUT" | sed -n 's/^INO_DIR:\(.*\)/\1/p' | sort -u | tr '\n' ' ')"
+INO_FSTAT="$(echo "$INOOUT" | sed -n 's/^INO_FSTAT:\(.*\)/\1/p')"
+if [[ "$(echo "$INO_FILES" | wc -w)" == "1" && "$(echo "$INO_DIRS" | wc -w)" == "1" &&
+      "${INO_FILES// /}" == "$INO_FSTAT" && "${INO_FILES// /}" != "${INO_DIRS// /}" ]]; then
+  echo "[PASS] routed inode numbers are stable across lookups"
+else
+  echo "[FAIL] routed inode churn: file=[$INO_FILES] dir=[$INO_DIRS] fstat=[$INO_FSTAT]"; PASS=0
 fi
 # Writes must reach the serve host, not a local shadow copy.
 if echo "$WROUT" | grep -q '^PROBES:' && [[ "$WROUT" != *FAIL* ]]; then
