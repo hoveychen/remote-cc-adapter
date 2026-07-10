@@ -2,11 +2,13 @@
 
 package main
 
-import "log"
+import (
+	"log"
+	"os/exec"
+)
 
-// ensureFuseMount is a no-op off Linux: macOS uses DYLD interposition (no FUSE),
-// and other platforms have no run-mode interceptor. Any caller-provided mount is
-// returned unchanged.
-func ensureFuseMount(existing, _ string, _ *log.Logger) (string, func(), error) {
-	return existing, func() {}, nil
+// wrapMountNamespace is a no-op off Linux: macOS uses DYLD interposition (no
+// FUSE, no mount namespace), and other platforms have no run-mode interceptor.
+func wrapMountNamespace(cmd *exec.Cmd, _, _ string, _ []string, _ *log.Logger) (*exec.Cmd, error) {
+	return cmd, nil
 }

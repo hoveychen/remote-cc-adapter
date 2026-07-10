@@ -7,6 +7,7 @@
 //	rca _spawn-proxy ...     — internal: stand-in for a routed subprocess
 //	                           (exec'd by the native interceptor, never by hand)
 //	rca _fuse ...            — internal: Linux lazy-slice FUSE daemon
+//	rca _nsrun ...           — internal: Linux private-mount-namespace launcher
 //
 // Example:
 //
@@ -41,6 +42,8 @@ func dispatch(args []string) int {
 		return cmdSpawnProxy(args[1:])
 	case "_fuse":
 		return cmdFuse(args[1:])
+	case "_nsrun":
+		return cmdNsRun(args[1:])
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 		return 0
@@ -76,7 +79,7 @@ after a literal -- is passed to <command> verbatim):
   --serve-fs-only         serve fs-RPC + exec bridge only; do not spawn <command>
 
 Advanced run-mode flags: --adapter-sock, --spawn-sentinel, --dylib,
---supervisor, --spawn-proxy, --fuse-mount.
+--supervisor, --spawn-proxy.
 
 Serve flags: --listen, --sock, --hole-punch, --relays, --announce
 (env RCA_SERVE_ANNOUNCE; advertise a public addr for direct dial behind

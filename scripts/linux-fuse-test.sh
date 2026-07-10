@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# linux-fuse-test.sh — verify Linux lazy slicing end to end. Runs INSIDE a
-# privileged Linux container with /dev/fuse:
+# linux-fuse-test.sh — verify the Linux routed-directory mount end to end. Runs
+# INSIDE a privileged Linux container with /dev/fuse:
 #
 #   docker run --rm --privileged --device /dev/fuse \
 #     -v "$PWD":/src -w /src golang:1.25 scripts/linux-fuse-test.sh
@@ -8,22 +8,24 @@
 # Topology mirrors production: the *run* host has an empty placeholder directory
 # at the routed path ($STORE), while the *serve* host has the real project
 # there. One container fakes both by giving the executor its own mount namespace
-# in which $REAL is bind-mounted onto $STORE. Everything else — adapter, FUSE
-# daemon, seccomp supervisor, consumers — sees $STORE as it really is on disk.
+# in which $REAL is bind-mounted onto $STORE. Everything else — adapter, seccomp
+# supervisor, consumers — sees $STORE as it really is on disk.
 #
-# Pipeline: rca serve (fs IO-RPC server, backs a real 10 MiB file) <- rca _fuse
-# (mounts that remote directory at its own absolute path) <- seccomp supervisor
-# <- raw-syscall consumers that read, enumerate, cross-check and mutate.
+# Pipeline: rca serve (fs IO-RPC server, backs a real 10 MiB file) <- rca _nsrun
+# (private mount namespace; mounts the remote directory at its own absolute path)
+# <- seccomp supervisor <- raw-syscall consumers that read, enumerate,
+# cross-check and mutate.
 set -euo pipefail
 
 command -v fusermount3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null && apt-get install -y -qq fuse3 >/dev/null; }
 
 WORK="$(mktemp -d)"
-REAL="$WORK/real"; mkdir -p "$REAL"   # the serve host's real project directory
+REAL="$WORK/real"; mkdir -p "$REAL"    # the serve host's real project directory
 STORE="$WORK/store"; mkdir -p "$STORE" # the run host's placeholder at the routed path
 EXECSOCK="$WORK/exec.sock"   # remote executor
 ADSOCK="$WORK/ad.sock"       # brain adapter (fs-RPC, raw protocol)
 BIG="$STORE/bigfile.dat"     # the path consumers ask for; content lives in $REAL
+DIR="$STORE/listme"
 MARK="LAZY-SLICE-MARKER-9931-XY"  # 25 bytes
 
 echo "== build =="
@@ -35,7 +37,7 @@ dd if=/dev/zero of="$REAL/bigfile.dat" bs=1M count=10 status=none
 printf '%s' "$MARK" | dd of="$REAL/bigfile.dat" bs=1 seek=$((5*1024*1024)) conv=notrunc status=none
 
 echo "== stage a routed directory (openat O_DIRECTORY + getdents64 must work) =="
-DIR="$STORE/listme"; mkdir -p "$REAL/listme/nested"
+mkdir -p "$REAL/listme/nested"
 : > "$REAL/listme/alpha.txt"; : > "$REAL/listme/beta.txt"
 
 echo "== start executor in its own mount ns: \$REAL bind-mounted onto \$STORE =="
@@ -51,15 +53,15 @@ echo "== start adapter (brain, routes STORE -> executor, serves fs-RPC) =="
 AD_PID=$!
 for _ in $(seq 1 50); do [[ -S "$ADSOCK" ]] && break; sleep 0.1; done
 
-echo "== start rca _fuse: mount the remote directory AT its own absolute path =="
-# The mount point and the remote root are the same absolute path, so openat,
-# stat, statx, getdents64 and getcwd all resolve through one filesystem. The old
-# shape — a flat hex(path) namespace that only openat knew how to reach — is what
-# gave the target a split view of its own cwd.
-"$WORK/rca" _fuse -mount "$STORE" -root "$STORE" -adapter-sock "$ADSOCK" >"$WORK/fuse.log" 2>&1 &
-FUSE_PID=$!
-for _ in $(seq 1 50); do mountpoint -q "$STORE" 2>/dev/null && break; sleep 0.1; done
-mountpoint -q "$STORE" || { echo "FATAL: routed mount never came up"; cat "$WORK/fuse.log"; exit 1; }
+# nsrun <workdir> <cmd...> — run cmd the way `rca <command>` runs it: inside a
+# private mount namespace where $STORE is a FUSE mount of the executor's copy of
+# $STORE, at that same absolute path. Every syscall the target makes — openat,
+# stat, statx, getdents64, getcwd — then resolves through one filesystem.
+nsrun() {
+  local wd="$1"; shift
+  RCC_REMOTE_PREFIXES="$STORE" "$WORK/rca" _nsrun \
+    -adapter-sock "$ADSOCK" -mount "$STORE" -workdir "$wd" -- "$@"
+}
 
 echo "== raw consumer: openat routed path, pread 25 bytes @ 5MiB =="
 cat > "$WORK/consumer.c" <<'EOF'
@@ -81,7 +83,7 @@ int main(int argc, char **argv) {
 EOF
 cc -O2 -o "$WORK/consumer" "$WORK/consumer.c"
 
-OUT="$(RCC_REMOTE_PREFIXES="$STORE" "$WORK/sup" "$WORK/consumer" "$BIG" 2>"$WORK/sup.log" || true)"
+OUT="$(nsrun "$WORK" "$WORK/sup" "$WORK/consumer" "$BIG" 2>"$WORK/sup.log" || true)"
 echo "consumer said: $OUT"
 
 echo "== raw consumer: openat routed DIRECTORY, getdents64 the entries =="
@@ -118,14 +120,15 @@ int main(int argc, char **argv) {
 EOF
 cc -O2 -o "$WORK/dirconsumer" "$WORK/dirconsumer.c"
 
-DIROUT="$(RCC_REMOTE_PREFIXES="$STORE" "$WORK/sup" "$WORK/dirconsumer" "$DIR" 2>&1 || true)"
+DIROUT="$(nsrun "$WORK" "$WORK/sup" "$WORK/dirconsumer" "$DIR" 2>&1 || true)"
 echo "dirconsumer said: $DIROUT"
 
 echo "== raw consumer: openat and stat must agree on the same routed path =="
-# The split-view bug: seccomp traps openat but not stat/statx, so a process sees
-# its routed cwd through two different filesystems at once. openat lands on the
-# FUSE-backed remote file; stat(2) falls through to the (empty) local directory
-# and returns ENOENT. bun cross-checks the two and wedges at startup.
+# The split-view bug this suite exists for: seccomp trapped openat but not
+# stat/statx, so a process saw its routed cwd through two filesystems at once.
+# openat landed on the FUSE-backed remote file; stat(2) fell through to the
+# (empty) local directory and returned ENOENT. bun cross-checks the two and
+# wedges at startup.
 cat > "$WORK/splitview.c" <<'EOF'
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -160,14 +163,14 @@ int main(int argc, char **argv) {
 EOF
 cc -O2 -o "$WORK/splitview" "$WORK/splitview.c"
 
-SPLITOUT="$(RCC_REMOTE_PREFIXES="$STORE" "$WORK/sup" "$WORK/splitview" "$BIG" 2>&1 || true)"
+SPLITOUT="$(nsrun "$WORK" "$WORK/sup" "$WORK/splitview" "$BIG" 2>&1 || true)"
 echo "splitview said: $SPLITOUT"
 
 echo "== raw consumer: a routed cwd must enumerate and resolve relative names =="
-# What claude actually does: chdir into the project, then openat(\".\") +
+# What claude actually does: chdir into the project, then openat(".") +
 # getdents64 and stat relative names. Routing is a literal prefix match on the
-# path string, so \".\" and \"bigfile.dat\" never match a remote prefix and fall
-# through to the empty local directory.
+# path string, so "." and "bigfile.dat" can never match a remote prefix — only a
+# real mount at the routed path makes them resolve.
 cat > "$WORK/cwdconsumer.c" <<'EOF'
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -184,7 +187,7 @@ struct linux_dirent64 {
   char d_name[];
 };
 int main(int argc, char **argv) {
-  (void)argc;
+  (void)argc; (void)argv;
   char cwd[4096];
   if (!getcwd(cwd, sizeof cwd)) { perror("getcwd"); return 1; }
   printf("CWD:%s\n", cwd);
@@ -209,29 +212,55 @@ int main(int argc, char **argv) {
 EOF
 cc -O2 -o "$WORK/cwdconsumer" "$WORK/cwdconsumer.c"
 
-CWDOUT="$(cd "$STORE" && RCC_REMOTE_PREFIXES="$STORE" "$WORK/sup" "$WORK/cwdconsumer" 2>&1 || true)"
+CWDOUT="$(nsrun "$STORE" "$WORK/sup" "$WORK/cwdconsumer" 2>&1 || true)"
 echo "cwdconsumer said: $CWDOUT"
 
 echo "== mutate the routed directory: create, write, truncate, mkdir, rename, remove =="
 # Exercises the FUSE write path (Create/Write/Setattr/Mkdir/Rename/Unlink/Rmdir)
 # with ordinary shell tools. Everything must land on the *serve* side, i.e. in
 # $REAL, which only the executor's mount namespace maps onto $STORE.
-WROUT=""
-write_probe() { WROUT="$WROUT $1"; }
-( echo "hello remote" > "$STORE/newfile.txt" ) 2>>"$WORK/write.err" && write_probe "create=ok" || write_probe "create=FAIL"
-[[ "$(cat "$REAL/newfile.txt" 2>/dev/null)" == "hello remote" ]] && write_probe "landed=ok" || write_probe "landed=FAIL"
-( printf 'xx' > "$STORE/newfile.txt" ) 2>>"$WORK/write.err" && write_probe "trunc=ok" || write_probe "trunc=FAIL"
-[[ "$(cat "$REAL/newfile.txt" 2>/dev/null)" == "xx" ]] && write_probe "truncbody=ok" || write_probe "truncbody=FAIL"
-mkdir "$STORE/newdir" 2>>"$WORK/write.err" && write_probe "mkdir=ok" || write_probe "mkdir=FAIL"
-mv "$STORE/newfile.txt" "$STORE/newdir/moved.txt" 2>>"$WORK/write.err" && write_probe "rename=ok" || write_probe "rename=FAIL"
-[[ -f "$REAL/newdir/moved.txt" ]] && write_probe "renamelanded=ok" || write_probe "renamelanded=FAIL"
-rm "$STORE/newdir/moved.txt" 2>>"$WORK/write.err" && write_probe "unlink=ok" || write_probe "unlink=FAIL"
-rmdir "$STORE/newdir" 2>>"$WORK/write.err" && write_probe "rmdir=ok" || write_probe "rmdir=FAIL"
-[[ ! -e "$REAL/newdir" ]] && write_probe "removed=ok" || write_probe "removed=FAIL"
-echo "write probes:$WROUT"
+cat > "$WORK/writeprobe.sh" <<EOF
+set -u
+out=""
+p() { out="\$out \$1"; }
+( echo "hello remote" > "$STORE/newfile.txt" ) && p "create=ok" || p "create=FAIL"
+[ "\$(cat "$REAL/newfile.txt" 2>/dev/null)" = "hello remote" ] && p "landed=ok" || p "landed=FAIL"
+( printf 'xx' > "$STORE/newfile.txt" ) && p "trunc=ok" || p "trunc=FAIL"
+[ "\$(cat "$REAL/newfile.txt" 2>/dev/null)" = "xx" ] && p "truncbody=ok" || p "truncbody=FAIL"
+mkdir "$STORE/newdir" && p "mkdir=ok" || p "mkdir=FAIL"
+mv "$STORE/newfile.txt" "$STORE/newdir/moved.txt" && p "rename=ok" || p "rename=FAIL"
+[ -f "$REAL/newdir/moved.txt" ] && p "renamelanded=ok" || p "renamelanded=FAIL"
+rm "$STORE/newdir/moved.txt" && p "unlink=ok" || p "unlink=FAIL"
+rmdir "$STORE/newdir" && p "rmdir=ok" || p "rmdir=FAIL"
+[ ! -e "$REAL/newdir" ] && p "removed=ok" || p "removed=FAIL"
+echo "PROBES:\$out"
+EOF
+WROUT="$(nsrun "$WORK" sh "$WORK/writeprobe.sh" 2>&1 || true)"
+echo "write probes: $WROUT"
 
-fusermount3 -u "$STORE" 2>/dev/null || umount "$STORE" 2>/dev/null || true
-kill "$FUSE_PID" 2>/dev/null || true
+echo "== the routed mount must be invisible outside the namespace =="
+# The mount shadows the run host's directory of the same name. Every other
+# process on the box must keep seeing the real one, so it lives in a private
+# mount namespace and must not propagate out of it.
+ISO_READY="$WORK/iso.ready"; ISO_GO="$WORK/iso.go"
+rm -f "$ISO_READY" "$ISO_GO" "$WORK/iso.inside"
+cat > "$WORK/isoprobe.sh" <<EOF
+set -u
+{ grep -c rcc-vfs /proc/self/mountinfo || true; } > "$WORK/iso.inside"
+ls "$STORE" > "$WORK/iso.inside.ls" 2>&1 || true
+touch "$ISO_READY"
+i=0; while [ ! -e "$ISO_GO" ] && [ \$i -lt 200 ]; do sleep 0.05; i=\$((i+1)); done
+EOF
+nsrun "$WORK" sh "$WORK/isoprobe.sh" >"$WORK/iso.log" 2>&1 &
+ISO_BG=$!
+for _ in $(seq 1 200); do [[ -e "$ISO_READY" ]] && break; sleep 0.05; done
+HOST_MOUNTED=no; mountpoint -q "$STORE" 2>/dev/null && HOST_MOUNTED=yes
+HOST_LS="$(ls -A "$STORE" 2>/dev/null | tr '\n' ' ')"
+touch "$ISO_GO"; wait "$ISO_BG" 2>/dev/null || true
+INSIDE_MOUNTS="$(cat "$WORK/iso.inside" 2>/dev/null || echo 0)"
+INSIDE_LS="$(tr '\n' ' ' < "$WORK/iso.inside.ls" 2>/dev/null || true)"
+echo "inside: mounts=$INSIDE_MOUNTS ls=[$INSIDE_LS]  outside: mounted=$HOST_MOUNTED ls=[$HOST_LS]"
+
 kill "$AD_PID" 2>/dev/null || true
 kill "$EXEC_PID" 2>/dev/null || true
 
@@ -265,8 +294,8 @@ else
   echo "[FAIL] nested subdirectory d_type wrong (ripgrep would not recurse)"; PASS=0
 fi
 # One consistent view: whatever openat resolves to, stat must resolve to as well
-# — same filesystem, same size. Anything else is the split view that deadlocks
-# bun on a remote-routed cwd.
+# — same mount, same size. Anything else is the split view that deadlocks bun on
+# a remote-routed cwd.
 SV_FD_FS="$(echo "$SPLITOUT" | sed -n 's/.*FSTYPE_FD:\([^ ]*\).*/\1/p')"
 SV_PATH_FS="$(echo "$SPLITOUT" | sed -n 's/.*FSTYPE_PATH:\(.*\)/\1/p')"
 SV_FSTAT="$(echo "$SPLITOUT" | sed -n 's/SIZE_FSTAT:\([0-9]*\).*/\1/p')"
@@ -289,11 +318,17 @@ else
   echo "[FAIL] routed cwd is not the remote directory: $(echo "$CWDOUT" | tr '\n' ' ')"; PASS=0
 fi
 # Writes must reach the serve host, not a local shadow copy.
-if [[ "$WROUT" != *FAIL* ]]; then
-  echo "[PASS] routed directory is writable end to end:$WROUT"
+if echo "$WROUT" | grep -q '^PROBES:' && [[ "$WROUT" != *FAIL* ]]; then
+  echo "[PASS] routed directory is writable end to end"
 else
-  echo "[FAIL] routed write path:$WROUT"; PASS=0
-  [[ -s "$WORK/write.err" ]] && sed 's/^/       /' "$WORK/write.err"
+  echo "[FAIL] routed write path: $WROUT"; PASS=0
+fi
+# Namespace isolation: mounted inside, absent outside, while the target runs.
+if [[ "$INSIDE_MOUNTS" -ge 1 && "$INSIDE_LS" == *bigfile.dat* &&
+      "$HOST_MOUNTED" == "no" && -z "${HOST_LS// /}" ]]; then
+  echo "[PASS] routed mount is private to the target's namespace"
+else
+  echo "[FAIL] namespace leak: inside(mounts=$INSIDE_MOUNTS ls=$INSIDE_LS) outside(mounted=$HOST_MOUNTED ls=$HOST_LS)"; PASS=0
 fi
 echo "==================="
 rm -rf "$WORK"

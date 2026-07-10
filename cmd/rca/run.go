@@ -50,7 +50,6 @@ type runOpts struct {
 	dylib       string
 	supervisor  string
 	spawnProxy  string
-	fuseMnt     string
 }
 
 // flag kinds for the run-mode extractor.
@@ -78,7 +77,6 @@ var ownedFlags = map[string]int{
 	"dylib":          kindString,
 	"supervisor":     kindString,
 	"spawn-proxy":    kindString,
-	"fuse-mount":     kindString,
 }
 
 // parseRunArgs extracts rca-owned flags from args; the first non-flag token is
@@ -114,8 +112,6 @@ func parseRunArgs(args []string) (*runOpts, error) {
 			o.supervisor = val
 		case "spawn-proxy":
 			o.spawnProxy = val
-		case "fuse-mount":
-			o.fuseMnt = val
 		}
 		return nil
 	}
@@ -382,17 +378,6 @@ func cmdRun(args []string) int {
 		return 0
 	}
 
-	// On Linux the seccomp supervisor redirects routed opens to a rcc-fuse
-	// mount; auto-orchestrate it so `rca <command>` is a single command (macOS
-	// uses DYLD interposition and needs none). No-op if --fuse-mount was given.
-	fuseMnt, fuseCleanup, err := ensureFuseMount(o.fuseMnt, o.adapterSock, logger)
-	if err != nil {
-		logger.Printf("fuse mount: %v", err)
-		return 1
-	}
-	defer fuseCleanup()
-	o.fuseMnt = fuseMnt
-
 	// Build and spawn the intercepted target process.
 	cfg := &adapter.LaunchConfig{
 		ClaudePath:     target,
@@ -405,13 +390,29 @@ func cmdRun(args []string) int {
 		SpawnSentinel:  o.sentinel,
 		DylibPath:      o.dylib,
 		SupervisorPath: o.supervisor,
-		FuseMnt:        o.fuseMnt,
 	}
 	cmd, err := cfg.BuildCommand()
 	if err != nil {
 		logger.Print(err)
 		return 1
 	}
+
+	// On Linux the target runs inside a private mount namespace where each remote
+	// prefix is mounted at its own absolute path, so every syscall — not just the
+	// intercepted ones — sees the remote directory. macOS uses DYLD interposition
+	// and needs none of this.
+	workdir := o.workdir
+	if workdir == "" {
+		if workdir, err = os.Getwd(); err != nil {
+			logger.Printf("getwd: %v", err)
+			return 1
+		}
+	}
+	if cmd, err = wrapMountNamespace(cmd, o.adapterSock, workdir, route.RemotePrefixes(), logger); err != nil {
+		logger.Printf("mount namespace: %v", err)
+		return 1
+	}
+
 	if o.printCmd {
 		fmt.Println(strings.Join(cmd.Args, " "))
 		for _, kv := range injectedEnv(cfg) {
@@ -498,14 +499,8 @@ func injectedEnv(cfg *adapter.LaunchConfig) []string {
 		adapter.EnvSpawnSentinel + "=" + cfg.SpawnSentinel,
 		adapter.EnvClaudePath + "=" + cfg.ClaudePath,
 	}
-	switch runtime.GOOS {
-	case "darwin":
+	if runtime.GOOS == "darwin" {
 		env = append(env, adapter.EnvDylib+"="+cfg.DylibPath)
-	case "linux":
-		// The seccomp+ptrace supervisor reads RCC_FUSE_MNT for the openat
-		// redirect; subprocess routing reads the RCC_SPAWN_PROXY/EXECUTOR_SOCK
-		// above. RCC_CLAUDE_PATH keeps the target itself (and its re-spawns) local.
-		env = append(env, adapter.EnvFuseMnt+"="+cfg.FuseMnt)
 	}
 	return env
 }

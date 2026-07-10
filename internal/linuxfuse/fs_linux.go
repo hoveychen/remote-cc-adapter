@@ -82,9 +82,13 @@ func mountOpts(name string, directMount bool) *fs.Options {
 	return &fs.Options{MountOptions: fuse.MountOptions{
 		FsName: "rcc-vfs",
 		Name:   name,
-		// A private mount namespace has no fusermount3 helper contract to honour
-		// and may not even have /dev/fuse reachable through it; mount(2) directly.
-		DirectMount: directMount,
+		// Inside a private mount namespace, mount(2) directly. Strict, because
+		// go-fuse's silent fallback runs the setuid fusermount3 helper, which
+		// registers the mount against the *host's* mount table — exactly the leak
+		// the namespace exists to prevent — and then fails anyway. A real errno
+		// here is far more useful than "fusermount exited with code 256".
+		DirectMount:       directMount,
+		DirectMountStrict: directMount,
 	}}
 }
 

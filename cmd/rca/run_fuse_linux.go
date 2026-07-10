@@ -2,93 +2,36 @@
 
 package main
 
-// Linux run mode needs a rcc-fuse mount that the seccomp supervisor redirects
-// routed opens to. ensureFuseMount auto-orchestrates it — spawning `rca _fuse`
-// against the adapter fs-RPC socket and waiting for the mount to come up — so
-// `rca <command>` is a single command on Linux, matching the macOS DYLD path
-// (which needs no FUSE). An external harness can still pre-mount and pass
-// --fuse-mount, in which case that mount is used as-is.
+// Linux run mode puts the target inside a private mount namespace where each
+// remote-routed directory is a FUSE mount of the executor's copy, at the same
+// absolute path (see cmd/rca/nsrun_linux.go). wrapMountNamespace rewrites the
+// already-built target command into `rca _nsrun ... -- <target argv>` so
+// `rca <command>` stays a single command, matching the macOS DYLD path (which
+// needs no FUSE).
 
 import (
-	"bufio"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
-	"strings"
-	"syscall"
-	"time"
 )
 
-func ensureFuseMount(existing, adapterSock string, logger *log.Logger) (string, func(), error) {
-	noop := func() {}
-	if existing != "" {
-		return existing, noop, nil // caller/harness provided its own mount
-	}
-	exe, err := os.Executable()
+func wrapMountNamespace(cmd *exec.Cmd, adapterSock, workdir string, remotePrefixes []string, logger *log.Logger) (*exec.Cmd, error) {
+	self, err := os.Executable()
 	if err != nil {
-		return "", noop, fmt.Errorf("locate rca binary: %w", err)
+		return nil, err
 	}
-	mnt, err := os.MkdirTemp("", "rcc-fuse-")
-	if err != nil {
-		return "", noop, err
+	args := []string{"_nsrun", "-adapter-sock", adapterSock, "-workdir", workdir}
+	for _, p := range remotePrefixes {
+		args = append(args, "-mount", p)
 	}
-	cmd := exec.Command(exe, "_fuse", "-mount", mnt, "-adapter-sock", adapterSock)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(mnt)
-		return "", noop, fmt.Errorf("spawn rca _fuse: %w", err)
-	}
+	args = append(args, "--")
+	args = append(args, cmd.Args...)
 
-	waitDone := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(waitDone) }()
-	cleanup := func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM) // _fuse unmounts on signal
-		}
-		select {
-		case <-waitDone:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-		}
-		// Belt-and-suspenders: force-unmount in case the helper died dirty.
-		_ = exec.Command("fusermount3", "-u", mnt).Run()
-		_ = exec.Command("fusermount", "-u", mnt).Run()
-		_ = os.RemoveAll(mnt)
-	}
-
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		if isMounted(mnt) {
-			logger.Printf("rcc-fuse mounted at %s", mnt)
-			return mnt, cleanup, nil
-		}
-		select {
-		case <-waitDone:
-			cleanup()
-			return "", noop, fmt.Errorf("rca _fuse exited before the mount came up")
-		default:
-		}
-		if time.Now().After(deadline) {
-			cleanup()
-			return "", noop, fmt.Errorf("rcc-fuse mount %s did not come up within 15s", mnt)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// isMounted reports whether path is a mount point per /proc/mounts.
-func isMounted(path string) bool {
-	f, err := os.Open("/proc/mounts")
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if fields := strings.Fields(sc.Text()); len(fields) >= 2 && fields[1] == path {
-			return true
-		}
-	}
-	return false
+	logger.Printf("routing %d remote prefix(es) through a private mount namespace", len(remotePrefixes))
+	wrapped := exec.Command(self, args...)
+	wrapped.Env = cmd.Env
+	wrapped.Stdin, wrapped.Stdout, wrapped.Stderr = cmd.Stdin, cmd.Stdout, cmd.Stderr
+	// The working directory is applied inside the namespace, after the mounts
+	// exist; setting it here would resolve against the host's directory instead.
+	return wrapped, nil
 }

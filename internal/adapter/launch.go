@@ -20,7 +20,6 @@ const (
 	EnvRemotePrefix  = "RCC_REMOTE_PREFIXES" // ':'-joined remote-routed path prefixes
 	EnvSpawnSentinel = "RCC_SPAWN_SENTINEL"  // marker that forces a subprocess remote
 	EnvClaudePath    = "RCC_CLAUDE_PATH"     // claude binary path; kept local when re-spawned
-	EnvFuseMnt       = "RCC_FUSE_MNT"        // Linux: FUSE mount the seccomp supervisor redirects opens to
 	EnvDylib         = "DYLD_INSERT_LIBRARIES"
 )
 
@@ -46,9 +45,6 @@ type LaunchConfig struct {
 	DylibPath string
 	// SupervisorPath is the Linux seccomp supervisor binary (ignored on macOS).
 	SupervisorPath string
-	// FuseMnt is the Linux rcc-fuse mount point the supervisor redirects routed
-	// opens to (ignored on macOS).
-	FuseMnt string
 
 	// ExtraEnv is appended to the child environment (KEY=VALUE).
 	ExtraEnv []string
@@ -82,14 +78,10 @@ func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
 		if c.SupervisorPath == "" {
 			return nil, fmt.Errorf("adapter: SupervisorPath is required on Linux")
 		}
-		if c.FuseMnt == "" {
-			return nil, fmt.Errorf("adapter: FuseMnt is required on Linux (the rcc-fuse mount)")
-		}
-		// The supervisor installs the seccomp filter, then execs claude; it
-		// redirects routed opens to the rcc-fuse mount.
+		// The supervisor installs the seccomp filter, then execs claude. Routed
+		// paths are served by the FUSE mounts rca _nsrun sets up around it.
 		args := append([]string{c.ClaudePath}, c.Args...)
 		cmd = exec.Command(c.SupervisorPath, args...)
-		env = append(env, EnvFuseMnt+"="+c.FuseMnt)
 	default:
 		return nil, fmt.Errorf("adapter: unsupported platform %q", runtime.GOOS)
 	}
