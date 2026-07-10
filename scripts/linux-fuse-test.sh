@@ -238,6 +238,40 @@ EOF
 WROUT="$(nsrun "$WORK" sh "$WORK/writeprobe.sh" 2>&1 || true)"
 echo "write probes: $WROUT"
 
+echo "== subprocess routing: execve under a routed cwd is rewritten to the proxy =="
+# The supervisor's only remaining seccomp job. Its BPF filter must send execve to
+# SECCOMP_RET_TRACE and everything else to RET_ALLOW; an off-by-one in the jump
+# offsets silently sends execve down the wrong branch and it runs local.
+cat > "$WORK/fakeproxy" <<'EOF'
+#!/bin/sh
+echo "PROXY:$*"
+EOF
+chmod +x "$WORK/fakeproxy"
+cat > "$WORK/execprobe.c" <<'EOF'
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+extern char **environ;
+// Raw execve, the way bun issues it — glibc's wrapper is not what we must catch.
+int main(void) {
+  char *av[] = {"echo", "hi", 0};
+  syscall(SYS_execve, "/bin/echo", av, environ);
+  perror("execve");
+  return 1;
+}
+EOF
+cc -O2 -o "$WORK/execprobe" "$WORK/execprobe.c"
+
+# RCC_CLAUDE_PATH keeps the supervisor's own exec of the probe local, exactly as
+# it keeps claude local in production; only the probe's child execve routes.
+export RCC_SPAWN_PROXY="$WORK/fakeproxy" RCC_CLAUDE_PATH="$WORK/execprobe" RCC_REMOTE_PREFIXES="$STORE"
+REMOTE_EXEC="$(nsrun "$STORE" "$WORK/sup" "$WORK/execprobe" 2>&1 || true)"
+echo "routed-cwd exec: $REMOTE_EXEC"
+LOCAL_EXEC="$(cd "$WORK" && "$WORK/sup" "$WORK/execprobe" 2>&1 || true)"
+echo "local-cwd exec: $LOCAL_EXEC"
+unset RCC_SPAWN_PROXY RCC_CLAUDE_PATH
+
 echo "== the routed mount must be invisible outside the namespace =="
 # The mount shadows the run host's directory of the same name. Every other
 # process on the box must keep seeing the real one, so it lives in a private
@@ -322,6 +356,19 @@ if echo "$WROUT" | grep -q '^PROBES:' && [[ "$WROUT" != *FAIL* ]]; then
   echo "[PASS] routed directory is writable end to end"
 else
   echo "[FAIL] routed write path: $WROUT"; PASS=0
+fi
+# Subprocess routing: the supervisor's execve trap still fires, and still routes
+# by cwd. Guards the seccomp filter's BPF jump offsets, which are relative to the
+# *following* instruction and have been off by one before.
+if [[ "$REMOTE_EXEC" == "PROXY:_spawn-proxy /bin/echo echo hi" ]]; then
+  echo "[PASS] execve under a routed cwd was rewritten to the spawn proxy"
+else
+  echo "[FAIL] routed execve not rewritten: $REMOTE_EXEC"; PASS=0
+fi
+if [[ "$LOCAL_EXEC" == "hi" ]]; then
+  echo "[PASS] execve under a local cwd ran unmodified"
+else
+  echo "[FAIL] local execve was disturbed: $LOCAL_EXEC"; PASS=0
 fi
 # Namespace isolation: mounted inside, absent outside, while the target runs.
 if [[ "$INSIDE_MOUNTS" -ge 1 && "$INSIDE_LS" == *bigfile.dat* &&

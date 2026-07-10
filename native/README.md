@@ -52,15 +52,22 @@ table (and the executor's per-stream one) stay valid across the sequence.
 - **macOS requires a re-signed claude.** `DYLD_INSERT_LIBRARIES` is ignored for a
   hardened-runtime binary, so the adapter runs an ad-hoc re-signed *copy*
   (`--resign`); the original install is never touched (design doc §4.2).
-- **Linux lazy-slices reads via FUSE.** seccomp only traps `openat`; the injected
-  fd's later `read`/`lseek` are real syscalls the supervisor never sees. So the
-  supervisor redirects a routed `openat` to a FUSE-backed file under
-  `RCC_FUSE_MNT` (served by `cmd/rcc-fuse`), and the kernel routes that file's
-  reads to the FUSE daemon, which fetches each read as an on-demand slice from the
-  adapter. Only files opened through the mount incur FUSE callbacks, so the
-  target's other I/O is untouched (design doc §4.1.3 step 2, §4.3). Verified by
-  `scripts/linux-fuse-test.sh`.
-- **Linux needs privilege + FUSE.** `NEW_LISTENER` + `ADDFD` require
-  `CAP_SYS_ADMIN` or a user-namespace setup, and the FUSE mount needs `/dev/fuse`
-  + `fusermount3`; the tests use `--privileged --device /dev/fuse` (design doc
-  §4.1.3).
+- **Linux does file I/O with a mount, not with seccomp.** The supervisor traps
+  only `execve`/`execveat`. Routed directories are FUSE mounts that `rca _nsrun`
+  places at their own absolute paths inside the target's private mount namespace,
+  so the kernel answers `openat`, `stat`, `statx`, `getdents64` and `getcwd` from
+  one filesystem and reads arrive as on-demand slices (design doc §4.1.3 step 2,
+  §4.3). Verified by `scripts/linux-fuse-test.sh`.
+
+  It used to trap `openat` as a seccomp USER_NOTIF and inject a FUSE-backed fd.
+  That routed `openat` and nothing else, so a target saw its own working directory
+  through two filesystems at once — `fstatat(dirfd, name)` answered from the
+  remote while `stat(fullpath)` returned ENOENT from the local disk — and Bun
+  wedged at startup cross-checking the two. Trapping the whole stat family instead
+  would have cost ~5.6k extra user-space round trips per claude run, with no
+  kernel caching.
+- **Linux needs FUSE, and CAP_SYS_ADMIN or a user namespace.** Mounting needs
+  `/dev/fuse` and `CAP_SYS_ADMIN`; unprivileged callers get the capability from a
+  user namespace `rca _nsrun` creates for them (identity uid mapping, ambient
+  `CAP_SYS_ADMIN`, dropped again before the target is spawned). The tests use
+  `--privileged --device /dev/fuse` (design doc §4.1.3).

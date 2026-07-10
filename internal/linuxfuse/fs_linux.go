@@ -1,19 +1,13 @@
 //go:build linux
 
-// Package linuxfuse backs the Linux interceptor's view of remote-routed paths
-// with a FUSE filesystem, so routed reads are served one slice at a time from
-// the adapter instead of fetching whole files up front (design doc §4.1.3 /
-// §4.3).
+// Package linuxfuse backs the Linux target's view of remote-routed paths with a
+// FUSE filesystem, so routed reads are served one slice at a time from the
+// adapter instead of fetching whole files up front (design doc §4.1.3 / §4.3).
 //
-// Two mount shapes share the same nodes:
-//
-//   - MountRouted(dir, remote) makes <dir> *be* the remote directory <remote>.
-//     Mounted at the routed path itself, inside the target's private mount
-//     namespace, it gives every syscall — openat, stat, statx, getdents64,
-//     getcwd — one consistent view. This is the shape run mode uses.
-//
-//   - Mount(dir) exposes a flat namespace of hex(path) entries for callers that
-//     resolve a routed absolute path by hand.
+// MountRouted(dir, remote) makes <dir> *be* the remote directory <remote>.
+// Mounted at the routed path itself, inside the target's private mount namespace
+// (see cmd/rca/nsrun_linux.go), it gives every syscall — openat, stat, statx,
+// getdents64, getcwd — one consistent view of that directory.
 //
 // Reads fetch exactly the requested [offset, len) slice over the fs IO-RPC
 // protocol (internal/protocol); writes go out as real POSIX mutations.
@@ -21,7 +15,6 @@ package linuxfuse
 
 import (
 	"context"
-	"encoding/hex"
 	pathpkg "path"
 	"sync"
 	"syscall"
@@ -92,28 +85,11 @@ func mountOpts(name string, directMount bool) *fs.Options {
 	}}
 }
 
-// Mount mounts the hex-entry filesystem at dir. Callers Wait/Unmount via the
-// server.
-func Mount(dir string, client *Client) (*fuse.Server, error) {
-	return fs.Mount(dir, &rootNode{client: client}, mountOpts("rcc", false))
-}
-
 // MountRouted mounts the remote directory `remote` at `dir`, so paths under dir
 // resolve to the executor's filesystem. Pass dir == remote to make the routed
 // absolute path mean the same thing to every syscall.
 func MountRouted(dir, remote string, client *Client, directMount bool) (*fuse.Server, error) {
 	return fs.Mount(dir, &dirNode{client: client, path: remote}, mountOpts("rcc-routed", directMount))
-}
-
-// EncodePath maps a real path to a FUSE entry name (hex avoids '/' in names).
-func EncodePath(p string) string { return hex.EncodeToString([]byte(p)) }
-
-func decodePath(name string) (string, bool) {
-	b, err := hex.DecodeString(name)
-	if err != nil {
-		return "", false
-	}
-	return string(b), true
 }
 
 // fillAttr copies a stat response into a FUSE attribute block. Mode carries both
@@ -128,22 +104,6 @@ func fillAttr(a *fuse.Attr, resp *protocol.Response) {
 		a.Atime, a.Atimensec = uint64(sec), uint32(nsec)
 		a.Ctime, a.Ctimensec = uint64(sec), uint32(nsec)
 	}
-}
-
-// rootNode resolves <hex(path)> entries to file/dir nodes backed by the adapter.
-type rootNode struct {
-	fs.Inode
-	client *Client
-}
-
-var _ = fs.NodeLookuper((*rootNode)(nil))
-
-func (r *rootNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	path, ok := decodePath(name)
-	if !ok {
-		return nil, syscall.ENOENT
-	}
-	return newNode(ctx, &r.Inode, r.client, path, out)
 }
 
 // newNode stats path and materialises the matching node. A routed path may be a

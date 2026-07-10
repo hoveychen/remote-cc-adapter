@@ -1,53 +1,38 @@
-// rcc_seccomp.c — Linux seccomp-user-notify + ptrace supervisor for
-// remote-cc-adapter.
+// rcc_seccomp.c — Linux seccomp + ptrace supervisor for remote-cc-adapter.
 //
-// This is the brain-side interception載体 for Linux (design doc §4.1.3 / §4.2).
-// Unlike macOS, Bun on Linux issues raw syscalls that bypass glibc, so
-// LD_PRELOAD symbol interposition misses both its file I/O AND its subprocess
-// spawns; a seccomp filter traps at the syscall boundary instead and catches
-// everything.
+// This is the brain-side interception carrier for Linux (design doc §4.1.3 /
+// §4.2). It exists for exactly one job: SUBPROCESS ROUTING.
 //
-// Two interception paths, multiplexed in one supervisor process:
+// Bun on Linux issues raw syscalls that bypass glibc, so LD_PRELOAD symbol
+// interposition misses its subprocess spawns (verified 2026-07-09: strace saw
+// `claude doctor` raw-clone+execve /usr/bin/git, an LD_PRELOAD probe did not).
+// seccomp-notify cannot rewrite syscall arguments, so routing needs ptrace. The
+// filter returns SECCOMP_RET_TRACE for execve/execveat and the supervisor is
+// also the tracer (PTRACE_O_TRACESECCOMP), so each execve stops the tracee at
+// syscall entry with PTRACE_EVENT_SECCOMP. The supervisor applies the routing
+// decision (mirrors native/macos/rcc_interpose.c my_posix_spawn) and, for remote
+// routes, rewrites argv in tracee memory to
+//   [RCC_SPAWN_PROXY, _spawn-proxy, <orig-path>, <orig-argv...>]
+// so the spawn proxy (cmd/rca/spawnproxy.go) streams the process to the remote
+// executor. Local routes continue unchanged.
 //
-//   1. FILE I/O (openat) — SECCOMP_RET_USER_NOTIF. The child installs a filter
-//      that turns openat into a USER_NOTIF and hands the listener fd to the
-//      supervisor over a socketpair (SCM_RIGHTS). The supervisor reads the path
-//      from /proc/<pid>/mem and, for routed paths, injects a FUSE-backed fd via
-//      NOTIF_ADDFD(FLAG_SEND); non-routed opens get FLAG_CONTINUE. (ported from
-//      the validated POC seccomp/sec.c — DO NOT change this path, it is what
-//      makes lazy-slice file reads work, design doc §4.1.3 / §4.3.)
-//
-//   2. SUBPROCESS (execve/execveat) — SECCOMP_RET_TRACE. LD_PRELOAD can't see
-//      bun's raw clone+execve (verified 2026-07-09: strace saw the execve but an
-//      LD_PRELOAD probe did not), and seccomp-notify cannot rewrite syscall args,
-//      so subprocess routing needs ptrace. The same filter returns
-//      SECCOMP_RET_TRACE for execve/execveat; the supervisor is also the tracer
-//      (PTRACE_O_TRACESECCOMP), so each execve stops the tracee at syscall entry
-//      with PTRACE_EVENT_SECCOMP. The supervisor applies the routing decision
-//      (mirrors native/macos/rcc_interpose.c my_posix_spawn) and, for remote
-//      routes, rewrites argv in tracee memory to
-//        [RCC_SPAWN_PROXY, _spawn-proxy, <orig-path>, <orig-argv...>]
-//      so the spawn proxy (cmd/rca/spawnproxy.go) streams the process to the
-//      remote executor. Local routes continue unchanged.
-//
-// Multiplexing (the hard part): the two mechanisms use incompatible wait
-// primitives — the openat listener fd wants NOTIF_RECV, the ptrace stops want
-// waitpid — and signalfd does NOT reliably observe ptrace-stop SIGCHLDs
-// (verified 2026-07-09 on us-303: a poll() on signalfd+listener slept forever
-// while the tracee sat in a traced-stop). ptrace also binds each tracee to the
-// exact thread that attached it (the fork()ing main thread), so waitpid for a
-// tracee must run there. The supervisor therefore splits the two: the MAIN
-// thread is the tracer and runs a blocking waitpid(-1, __WALL) loop (all ptrace
-// calls live here); a second thread runs a blocking NOTIF_RECV loop on the
-// listener fd (ioctl is not thread-bound). The process exits when the main
-// tracee exits, which tears the openat thread down with it.
+// FILE I/O is NOT intercepted here. It used to be: openat was trapped as a
+// SECCOMP_RET_USER_NOTIF and routed opens got a FUSE-backed fd injected. That
+// gave the target a split view of its own working directory, because openat was
+// trapped and stat/statx/getdents64/getcwd were not — `fstatat(dirfd, name)`
+// answered from the remote while `stat(fullpath)` returned ENOENT from the local
+// filesystem, and bun wedged at startup cross-checking the two. Trapping the
+// whole stat family would have cost ~5.6k extra round trips per claude run with
+// no kernel caching. Instead `rca _nsrun` mounts each remote directory at its
+// own absolute path inside the target's private mount namespace, so the kernel
+// gives every syscall one consistent view for free.
 //
 // Invocation (by the adapter, see internal/adapter/launch.go):
 //   rcc_seccomp <target-binary> [args...]
-// Environment: RCC_FUSE_MNT, RCC_REMOTE_PREFIXES (file routing);
-//   RCC_SPAWN_PROXY, RCC_EXECUTOR_SOCK, RCC_SPAWN_SENTINEL, RCC_CLAUDE_PATH,
-//   RCC_LOCAL_BINS (subprocess routing). The spawn proxy inherits the tracee's
-//   env (which already carries RCC_EXECUTOR_SOCK), so no envp rewrite is needed.
+// Environment: RCC_REMOTE_PREFIXES, RCC_SPAWN_PROXY, RCC_EXECUTOR_SOCK,
+//   RCC_SPAWN_SENTINEL, RCC_CLAUDE_PATH, RCC_LOCAL_BINS. The spawn proxy inherits
+//   the tracee's env (which already carries RCC_EXECUTOR_SOCK), so no envp
+//   rewrite is needed.
 
 #define _GNU_SOURCE
 #include <stddef.h>
@@ -60,28 +45,18 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/prctl.h>
-#include <sys/ioctl.h>
 #include <sys/syscall.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/uio.h>
 #include <sys/types.h>
 #include <signal.h>
-#include <pthread.h>
 #include <elf.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
 
-#ifndef SECCOMP_ADDFD_FLAG_SEND
-#define SECCOMP_ADDFD_FLAG_SEND (1UL << 1)
-#endif
-#ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
-#define SECCOMP_USER_NOTIF_FLAG_CONTINUE (1UL << 0)
-#endif
 #ifndef PTRACE_EVENT_SECCOMP
 #define PTRACE_EVENT_SECCOMP 7
 #endif
@@ -108,48 +83,24 @@ static void lg(const char *fmt, ...) {
 
 static int seccomp(unsigned op, unsigned fl, void *a) { return syscall(__NR_seccomp, op, fl, a); }
 
-// The filter traps openat as a USER_NOTIF (file I/O, handled in-supervisor) and
-// execve/execveat as RET_TRACE (subprocess, handled via ptrace). Everything else
-// runs unmodified. RET_TRACE encodes a data value in the low 16 bits; we use 1.
+// The filter traps execve/execveat as RET_TRACE (subprocess routing, handled via
+// ptrace). Everything else — including all file I/O — runs unmodified.
+// RET_TRACE encodes a data value in the low 16 bits; we use 1.
 static int install_filter(void) {
   // BPF jump offsets are relative to the FOLLOWING instruction. Instruction
-  // indices: 0 LD, 1..3 JEQ, 4 RET_ALLOW, 5 RET_USER_NOTIF, 6 RET_TRACE.
-  //   openat   (idx1): jt -> idx5 (USER_NOTIF); offset = 5-2 = 3
-  //   execve   (idx2): jt -> idx6 (TRACE);      offset = 6-3 = 3
-  //   execveat (idx3): jt -> idx6 (TRACE);      offset = 6-4 = 2
+  // indices: 0 LD, 1..2 JEQ, 3 RET_ALLOW, 4 RET_TRACE.
+  //   execve   (idx1): jt -> idx4; offset = 4-2 = 2
+  //   execveat (idx2): jt -> idx4; offset = 4-3 = 1
   struct sock_filter f[] = {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 3, 0),
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 3, 0),
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 2, 0),
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                 // idx4
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),           // idx5: openat
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE | 1),           // idx6: execve/at
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 2, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),        // idx3
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE | 1),    // idx4: execve/at
   };
   struct sock_fprog p = {.len = sizeof f / sizeof f[0], .filter = f};
   prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-  return seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &p);
-}
-
-static int send_fd(int sock, int fd) {
-  struct msghdr m = {0};
-  char cbuf[CMSG_SPACE(sizeof(int))] = {0};
-  struct iovec io = {.iov_base = "x", .iov_len = 1};
-  m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = cbuf; m.msg_controllen = sizeof cbuf;
-  struct cmsghdr *c = CMSG_FIRSTHDR(&m);
-  c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
-  memcpy(CMSG_DATA(c), &fd, sizeof(int));
-  return sendmsg(sock, &m, 0);
-}
-static int recv_fd(int sock) {
-  struct msghdr m = {0};
-  char cbuf[CMSG_SPACE(sizeof(int))] = {0};
-  char d; struct iovec io = {.iov_base = &d, .iov_len = 1};
-  m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = cbuf; m.msg_controllen = sizeof cbuf;
-  if (recvmsg(sock, &m, 0) < 0) return -1;
-  struct cmsghdr *c = CMSG_FIRSTHDR(&m);
-  int fd; memcpy(&fd, CMSG_DATA(c), sizeof(int));
-  return fd;
+  return seccomp(SECCOMP_SET_MODE_FILTER, 0, &p);
 }
 
 // ---- tracee memory access --------------------------------------------------
@@ -163,12 +114,10 @@ static ssize_t read_mem(pid_t pid, unsigned long addr, void *out, size_t n) {
 }
 
 // read_cstr reads a NUL-terminated string from the tracee into a per-thread
-// buffer. The buffer MUST be thread-local: the openat NOTIF thread holds the
-// returned pointer across is_remote() and open_fuse() (which blocks on a real
-// open() through the FUSE mount), while the tracer thread reads execve paths and
-// argv strings concurrently. A shared buffer let one clobber the other — visible
-// as EXEC log lines whose arg0 belonged to some other syscall, and able to make
-// open_fuse() open a different remote path than the one that was routed.
+// buffer. The supervisor is single-threaded now that the openat listener is
+// gone, but the buffer stays thread-local: when it was shared, a second thread
+// reading concurrently clobbered it, and the symptom (EXEC log lines whose arg0
+// belonged to another syscall) took a while to trace back here.
 static char *read_cstr(pid_t pid, unsigned long addr) {
   static _Thread_local char b[4096];
   if (!addr) return NULL;
@@ -183,11 +132,6 @@ static char *read_cstr(pid_t pid, unsigned long addr) {
   b[strnlen(b, sizeof b - 1)] = 0;
   return b;
 }
-
-// read_path is read_cstr under the name the openat handler uses. Isolation from
-// the execve handler comes from read_cstr's buffer being thread-local, not from
-// a second buffer.
-static char *read_path(pid_t pid, unsigned long addr) { return read_cstr(pid, addr); }
 
 // ---- routing ---------------------------------------------------------------
 
@@ -277,52 +221,6 @@ static int route_spawn(pid_t pid, const char *path, char **av, int n, const char
   if (cwdrem) { *reason = "cwd-prefix"; return 1; }
   *reason = "default-local";
   return 0;
-}
-
-// ---- FUSE-backed redirection (openat path) ---------------------------------
-
-// open_fuse opens the routed path's FUSE-backed file under RCC_FUSE_MNT and
-// returns the fd (caller injects it). The entry name is hex(path), matching
-// linuxfuse.EncodePath — hex avoids '/' in the FUSE entry name.
-static int open_fuse(const char *path) {
-  const char *mnt = getenv("RCC_FUSE_MNT");
-  if (!mnt || !*mnt) return -1;
-  size_t pl = strlen(path), ml = strlen(mnt);
-  char *fp = malloc(ml + 1 + pl * 2 + 1);
-  if (!fp) return -1;
-  memcpy(fp, mnt, ml);
-  size_t k = ml;
-  fp[k++] = '/';
-  static const char *H = "0123456789abcdef";
-  for (size_t i = 0; i < pl; i++) {
-    unsigned char c = (unsigned char)path[i];
-    fp[k++] = H[c >> 4];
-    fp[k++] = H[c & 0xf];
-  }
-  fp[k] = 0;
-  int fd = open(fp, O_RDONLY);
-  free(fp);
-  return fd;
-}
-
-// handle_openat services one openat USER_NOTIF: routed paths get a FUSE-backed
-// fd injected (ADDFD_FLAG_SEND completes the notification); everything else gets
-// FLAG_CONTINUE (the kernel runs the real openat).
-static void handle_openat(int lf, struct seccomp_notif *req, struct seccomp_notif_resp *resp) {
-  char *path = read_path(req->pid, req->data.args[1]);
-  if (path && is_remote(path)) {
-    int ffd = open_fuse(path);
-    if (ffd >= 0) {
-      struct seccomp_notif_addfd af = {0};
-      af.id = req->id; af.flags = SECCOMP_ADDFD_FLAG_SEND; af.srcfd = ffd; af.newfd = 0;
-      if (ioctl(lf, SECCOMP_IOCTL_NOTIF_ADDFD, &af) == 0) { close(ffd); return; }
-      close(ffd);
-    }
-  }
-  memset(resp, 0, sizeof *resp);
-  resp->id = req->id;
-  resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-  ioctl(lf, SECCOMP_IOCTL_NOTIF_SEND, resp);
 }
 
 // ---- execve argv rewrite (ptrace path) -------------------------------------
@@ -445,57 +343,24 @@ static void rewrite_execve(pid_t pid) {
 static void rewrite_execve(pid_t pid) { (void)pid; } // non-x86_64: no rewrite
 #endif
 
-// ---- openat listener thread ------------------------------------------------
-
-// The openat USER_NOTIF path runs in its own thread: a blocking NOTIF_RECV loop.
-// It touches only the listener fd and FUSE (no ptrace), so it is safe off the
-// tracer thread. It exits when NOTIF_RECV fails (the tracee tree is gone) or
-// when the process exits under it.
-static void *openat_thread(void *arg) {
-  int lf = (int)(intptr_t)arg;
-  struct seccomp_notif *req = calloc(1, sizeof *req + 4096);
-  struct seccomp_notif_resp *resp = calloc(1, sizeof *resp + 4096);
-  if (!req || !resp) return NULL;
-  for (;;) {
-    memset(req, 0, sizeof *req);
-    if (ioctl(lf, SECCOMP_IOCTL_NOTIF_RECV, req) != 0) {
-      if (errno == EINTR) continue;
-      break; // listener gone: tracee tree exited
-    }
-    handle_openat(lf, req, resp);
-  }
-  free(req);
-  free(resp);
-  return NULL;
-}
-
 // ---- supervisor + tracer ---------------------------------------------------
 
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: rcc_seccomp <target> [args...]\n"); return 2; }
 
-  int sk[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sk) != 0) { perror("socketpair"); return 1; }
-
   pid_t pid = fork();
   if (pid == 0) {
-    close(sk[0]);
-    // Become traceable by the supervisor, install the filter, hand the openat
-    // listener fd back, then stop so the supervisor can set ptrace options
-    // before our execvp (which will trap as PTRACE_EVENT_SECCOMP and route).
+    // Become traceable by the supervisor, install the filter, then stop so the
+    // supervisor can set ptrace options before our execvp (which will trap as
+    // PTRACE_EVENT_SECCOMP and route).
     ptrace(PTRACE_TRACEME, 0, 0, 0);
-    int lf = install_filter();
-    if (lf < 0) { perror("seccomp install"); _exit(97); }
-    send_fd(sk[1], lf);
-    close(lf); close(sk[1]);
+    if (install_filter() != 0) { perror("seccomp install"); _exit(97); }
     kill(getpid(), SIGSTOP);
     execvp(argv[1], &argv[1]);
     perror("exec");
     _exit(96);
   }
-  close(sk[1]);
-  int lf = recv_fd(sk[0]);
-  if (lf < 0) { fprintf(stderr, "recv listener failed\n"); return 1; }
+  if (pid < 0) { perror("fork"); return 1; }
 
   // Wait for the child's post-TRACEME SIGSTOP, then arm ptrace: trap seccomp
   // RET_TRACE events (execve) and auto-attach fork/vfork/clone children so
@@ -506,11 +371,6 @@ int main(int argc, char **argv) {
   long opts = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
               PTRACE_O_TRACECLONE | PTRACE_O_EXITKILL;
   if (ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)opts) != 0) perror("setoptions");
-
-  // Hand the openat listener to a dedicated thread; the main thread stays the
-  // tracer (ptrace is thread-bound to the fork()ing thread).
-  pthread_t th;
-  pthread_create(&th, NULL, openat_thread, (void *)(intptr_t)lf);
 
   ptrace(PTRACE_CONT, pid, 0, 0);
 
@@ -551,6 +411,5 @@ int main(int argc, char **argv) {
     }
   }
 
-  close(lf); // unblocks the openat thread's NOTIF_RECV
   return exit_code;
 }

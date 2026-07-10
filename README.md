@@ -210,16 +210,24 @@ Repository layout, verified-status details, and the roadmap live in
 [`docs/design.md`](docs/design.md); the per-component map is in the directory
 READMEs ([`native/`](native/README.md), [`cmd/rca/embedded/`](cmd/rca/embedded/README.md)).
 
-Linux run mode routes both file reads and subprocess execution. The supervisor
-(`native/linux/rcc_seccomp.c`) traps `openat` as a seccomp USER_NOTIF (file I/O,
-redirected to the rcc-fuse mount) and `execve`/`execveat` as `SECCOMP_RET_TRACE`;
-it is also the ptracer, so each `execve` stops at syscall entry with
-`PTRACE_EVENT_SECCOMP` and — for paths that route remote — its argv is rewritten
-to `rca _spawn-proxy …` so the subprocess streams to the remote executor. The
-two paths run on separate threads (blocking `waitpid` tracer on the main thread,
-blocking `NOTIF_RECV` listener on a second thread); LD_PRELOAD can't intercept
-Bun's raw `clone+execve`, which is why ptrace is required. macOS routes both via
-DYLD interposition of `posix_spawn`.
+Linux run mode routes both file access and subprocess execution, by two separate
+mechanisms.
+
+Files: `rca _nsrun` puts the target in a private mount namespace and mounts each
+remote-routed directory there, as a FUSE filesystem, at the same absolute path it
+has on the remote. The kernel then gives every syscall — `openat`, `stat`,
+`statx`, `getdents64`, `getcwd` — one consistent view of that directory, and
+reads are fetched as on-demand slices rather than whole files.
+
+Subprocesses: the supervisor (`native/linux/rcc_seccomp.c`) traps
+`execve`/`execveat` as `SECCOMP_RET_TRACE` and is also the ptracer, so each
+`execve` stops at syscall entry with `PTRACE_EVENT_SECCOMP` and — for paths that
+route remote — its argv is rewritten to `rca _spawn-proxy …` so the subprocess
+streams to the remote executor. LD_PRELOAD cannot intercept Bun's raw
+`clone+execve`, which is why ptrace is required.
+
+macOS routes both via DYLD interposition, of the file syscalls and of
+`posix_spawn`.
 
 Known limits: NAT traversal is enabled but not yet field-tested across real
 networks; relative-path opens (`open("rel")`) stay local by design (claude's
