@@ -116,29 +116,54 @@ reachable address, run a **circuit-relay** on a host both sides *can* reach and
 point the remote at it:
 
 ```sh
-# On a host with a public address (raw TCP works; WebSocket lets it sit behind
-# an HTTPS reverse proxy that only exposes :8080 and terminates TLS):
-relay$ rca relay --announce /dns4/relay.example.com/tcp/443/tls/ws
-  relay peer id: 12D3Koo…
-  # pin a stable identity across restarts:
-  RCA_RELAY_KEY=… rca relay …
+# On a host with a public IP — a RAW TCP/UDP port (see the note below on why it
+# must NOT sit behind an HTTP reverse proxy):
+relay$ RCA_RELAY_KEY=… rca relay \
+         --listen   /ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1 \
+         --announce /ip4/<public-ip>/tcp/4001,/ip4/<public-ip>/udp/4001/quic-v1
+  relay peer id: 12D3Koo…   # pin RCA_RELAY_KEY so the PeerID survives restarts
 
 # On the NAT'd remote — reserve a slot on the relay; the pairing code then
 # carries a relayed /p2p-circuit address in addition to the direct ones:
-remote$ rca serve --relays /dns4/relay.example.com/tcp/443/tls/ws/p2p/12D3Koo…
+remote$ rca serve --relays /ip4/<public-ip>/tcp/4001/p2p/12D3Koo…
 
 # On the local machine — nothing changes; --code just works:
 local$  rca claude --code rca1.…
 ```
 
 The local side dials the remote through the relay, then libp2p's DCUtR
-hole-punching tries to **upgrade to a direct connection**; if the NATs can't be
-punched it keeps relaying (all traffic then transits the relay — a direct
-upgrade needs at least one side to present a reachable public endpoint). A
-`Dockerfile` at the repo root builds a relay image for a PaaS: it runs
-`rca relay` on `:8080`; set `RCA_RELAY_ANNOUNCE` to the public
-`/dns4/<host>/tcp/443/tls/ws` and bind `RCA_RELAY_KEY` (a secret) for a stable
-PeerID.
+hole-punching **upgrades to a direct connection**: over the relayed connection
+each side learns its own public address from the relay's `identify` observation,
+then both simultaneously dial to punch through their NATs. Once the direct
+connection is up the relay carries nothing (verified end-to-end: two hosts on
+different networks punched a direct TCP connection in ~1 s). If the NATs can't
+be punched — e.g. a symmetric NAT that remaps the port per destination — it
+keeps relaying.
+
+**The relay must expose a raw TCP/UDP port, not sit behind an HTTP reverse
+proxy.** DCUtR depends on the relay observing each endpoint's *real* public
+address and reporting it back via `identify`. An HTTPS proxy (Traefik, nginx, a
+PaaS that terminates TLS and forwards to `:8080`) makes the relay observe only
+the proxy's *internal* address; that address is private, gets filtered out, and
+the hole punch never initiates — so traffic relays forever. A WebSocket relay
+behind such a proxy still works as a *relay* (traffic flows), it just can never
+upgrade to a direct connection. For the direct upgrade give the relay its own
+public port, as above.
+
+The repo-root `Dockerfile` builds a minimal relay image (`ENTRYPOINT ["rca",
+"relay"]`). Run it with host networking so both the TCP and QUIC ports are
+published, and pin a stable key:
+
+```sh
+docker run -d --restart unless-stopped --name rca-relay --network host \
+  -e RCA_RELAY_KEY=<stable-key> <relay-image> \
+  --listen   /ip4/0.0.0.0/tcp/4001,/ip4/0.0.0.0/udp/4001/quic-v1 \
+  --announce /ip4/<public-ip>/tcp/4001,/ip4/<public-ip>/udp/4001/quic-v1
+```
+
+For an HTTP-only PaaS that can only ever *relay* (no direct upgrade), keep the
+WebSocket form instead: `rca relay` on `:8080` with
+`RCA_RELAY_ANNOUNCE=/dns4/<host>/tcp/443/tls/ws` behind the proxy.
 
 ## How it works
 
