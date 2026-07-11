@@ -30,7 +30,7 @@
 // Invocation (by the adapter, see internal/adapter/launch.go):
 //   rcc_seccomp <target-binary> [args...]
 // Environment: RCC_REMOTE_PREFIXES, RCC_SPAWN_PROXY, RCC_EXECUTOR_SOCK,
-//   RCC_SPAWN_SENTINEL, RCC_CLAUDE_PATH, RCC_LOCAL_BINS. The spawn proxy inherits
+//   RCC_SPAWN_SENTINEL, RCC_TARGET_PATH, RCC_LOCAL_BINS. The spawn proxy inherits
 //   the tracee's env (which already carries RCC_EXECUTOR_SOCK), so no envp
 //   rewrite is needed.
 
@@ -165,8 +165,8 @@ static int spawn_is_local_bin(const char *path) {
     if (strstr(path, defaults[i])) return 1;
   const char *proxy = getenv("RCC_SPAWN_PROXY");
   if (proxy && *proxy && strstr(path, proxy)) return 1;
-  const char *claude = getenv("RCC_CLAUDE_PATH");
-  if (claude && *claude && strstr(path, claude)) return 1;
+  const char *target = getenv("RCC_TARGET_PATH");
+  if (target && *target && strstr(path, target)) return 1;
   const char *bins = getenv("RCC_LOCAL_BINS");
   if (bins && *bins) {
     char *dup = strdup(bins);

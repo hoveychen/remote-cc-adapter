@@ -485,8 +485,8 @@ static int spawn_is_local_bin(const char *path) {
   // containing those three letters.
   const char *proxy = getenv("RCC_SPAWN_PROXY");
   if (proxy && *proxy && strstr(path, proxy)) return 1;
-  const char *claude = getenv("RCC_CLAUDE_PATH");
-  if (claude && *claude && strstr(path, claude)) return 1;
+  const char *target = getenv("RCC_TARGET_PATH");
+  if (target && *target && strstr(path, target)) return 1;
   const char *bins = getenv("RCC_LOCAL_BINS");
   if (bins && *bins) {
     char *dup = strdup(bins);

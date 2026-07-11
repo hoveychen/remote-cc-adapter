@@ -19,20 +19,20 @@ const (
 	EnvSpawnProxy    = "RCC_SPAWN_PROXY"     // rca binary; routed spawns exec `rca _spawn-proxy ...`
 	EnvRemotePrefix  = "RCC_REMOTE_PREFIXES" // ':'-joined remote-routed path prefixes
 	EnvSpawnSentinel = "RCC_SPAWN_SENTINEL"  // marker that forces a subprocess remote
-	EnvClaudePath    = "RCC_CLAUDE_PATH"     // claude binary path; kept local when re-spawned
+	EnvTargetPath    = "RCC_TARGET_PATH"     // target agent binary path; kept local when re-spawned
 	EnvDylib         = "DYLD_INSERT_LIBRARIES"
 )
 
-// LaunchConfig describes how to spawn the intercepted claude process.
+// LaunchConfig describes how to spawn the intercepted target agent process.
 type LaunchConfig struct {
-	// ClaudePath is the claude binary to run. On macOS the adapter runs a
-	// re-signed copy (see PrepareMacOSCopy); on Linux it is the real binary
-	// launched under the seccomp supervisor.
-	ClaudePath string
-	// Args are the arguments passed to claude.
+	// TargetPath is the target agent binary to run (e.g. claude, codex). On macOS
+	// the adapter runs a re-signed copy (see PrepareMacOSCopy); on Linux it is the
+	// real binary launched under the seccomp supervisor.
+	TargetPath string
+	// Args are the arguments passed to the target.
 	Args []string
-	// WorkDir sets claude's working directory. Point it under a remote prefix to
-	// exercise natural cwd-based subprocess routing. Empty inherits the adapter's.
+	// WorkDir sets the target's working directory. Point it under a remote prefix
+	// to exercise natural cwd-based subprocess routing. Empty inherits the adapter's.
 	WorkDir string
 
 	AdapterSock    string
@@ -50,11 +50,11 @@ type LaunchConfig struct {
 	ExtraEnv []string
 }
 
-// BuildCommand assembles the *exec.Cmd that launches the intercepted claude
-// process for the current platform. It does not start the process.
+// BuildCommand assembles the *exec.Cmd that launches the intercepted target
+// agent process for the current platform. It does not start the process.
 func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
-	if c.ClaudePath == "" {
-		return nil, fmt.Errorf("adapter: ClaudePath is required")
+	if c.TargetPath == "" {
+		return nil, fmt.Errorf("adapter: TargetPath is required")
 	}
 	env := append(os.Environ(),
 		EnvAdapterSock+"="+c.AdapterSock,
@@ -62,7 +62,7 @@ func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
 		EnvSpawnProxy+"="+c.SpawnProxyPath,
 		EnvRemotePrefix+"="+strings.Join(c.RemotePrefixes, ":"),
 		EnvSpawnSentinel+"="+c.SpawnSentinel,
-		EnvClaudePath+"="+c.ClaudePath,
+		EnvTargetPath+"="+c.TargetPath,
 	)
 	env = append(env, c.ExtraEnv...)
 
@@ -72,15 +72,15 @@ func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
 		if c.DylibPath == "" {
 			return nil, fmt.Errorf("adapter: DylibPath is required on macOS")
 		}
-		cmd = exec.Command(c.ClaudePath, c.Args...)
+		cmd = exec.Command(c.TargetPath, c.Args...)
 		env = append(env, EnvDylib+"="+c.DylibPath)
 	case "linux":
 		if c.SupervisorPath == "" {
 			return nil, fmt.Errorf("adapter: SupervisorPath is required on Linux")
 		}
-		// The supervisor installs the seccomp filter, then execs claude. Routed
+		// The supervisor installs the seccomp filter, then execs the target. Routed
 		// paths are served by the FUSE mounts rca _nsrun sets up around it.
-		args := append([]string{c.ClaudePath}, c.Args...)
+		args := append([]string{c.TargetPath}, c.Args...)
 		cmd = exec.Command(c.SupervisorPath, args...)
 	default:
 		return nil, fmt.Errorf("adapter: unsupported platform %q", runtime.GOOS)
@@ -93,22 +93,22 @@ func (c *LaunchConfig) BuildCommand() (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// PrepareMacOSCopy copies the real claude binary to dest and ad-hoc re-signs it
-// so an external interpose dylib can be loaded (design doc §4.2). The original
-// Anthropic signature is dropped in the process; the copy is for local
+// PrepareMacOSCopy copies the real target agent binary to dest and ad-hoc
+// re-signs it so an external interpose dylib can be loaded (design doc §4.2). The
+// original signature is dropped in the process; the copy is for local
 // interception only and must never be redistributed. Returns dest on success.
 //
 // This mutates only files under dest's directory; it never touches the real
-// installed claude binary.
-func PrepareMacOSCopy(realClaude, dest string) (string, error) {
+// installed target binary.
+func PrepareMacOSCopy(realTarget, dest string) (string, error) {
 	if runtime.GOOS != "darwin" {
 		return "", fmt.Errorf("adapter: PrepareMacOSCopy is macOS-only")
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return "", err
 	}
-	if err := copyFile(realClaude, dest, 0o755); err != nil {
-		return "", fmt.Errorf("copy claude: %w", err)
+	if err := copyFile(realTarget, dest, 0o755); err != nil {
+		return "", fmt.Errorf("copy target binary: %w", err)
 	}
 	// Ad-hoc re-sign, dropping hardened runtime so DYLD_INSERT_LIBRARIES works.
 	// disable-library-validation is already set in the original entitlements.

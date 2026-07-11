@@ -392,7 +392,7 @@ func cmdRun(args []string) int {
 
 	// Build and spawn the intercepted target process.
 	cfg := &adapter.LaunchConfig{
-		ClaudePath:     target,
+		TargetPath:     target,
 		Args:           o.args,
 		WorkDir:        o.workdir,
 		AdapterSock:    o.adapterSock,
@@ -489,7 +489,7 @@ func injectedEnv(cfg *adapter.LaunchConfig) []string {
 		adapter.EnvSpawnProxy + "=" + cfg.SpawnProxyPath,
 		adapter.EnvRemotePrefix + "=" + strings.Join(cfg.RemotePrefixes, ":"),
 		adapter.EnvSpawnSentinel + "=" + cfg.SpawnSentinel,
-		adapter.EnvClaudePath + "=" + cfg.ClaudePath,
+		adapter.EnvTargetPath + "=" + cfg.TargetPath,
 	}
 	if runtime.GOOS == "darwin" {
 		env = append(env, adapter.EnvDylib+"="+cfg.DylibPath)

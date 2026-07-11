@@ -299,14 +299,14 @@ int main(void) {
 EOF
 cc -O2 -o "$WORK/execprobe" "$WORK/execprobe.c"
 
-# RCC_CLAUDE_PATH keeps the supervisor's own exec of the probe local, exactly as
-# it keeps claude local in production; only the probe's child execve routes.
-export RCC_SPAWN_PROXY="$WORK/fakeproxy" RCC_CLAUDE_PATH="$WORK/execprobe" RCC_REMOTE_PREFIXES="$STORE"
+# RCC_TARGET_PATH keeps the supervisor's own exec of the probe local, exactly as
+# it keeps the target agent local in production; only the probe's child execve routes.
+export RCC_SPAWN_PROXY="$WORK/fakeproxy" RCC_TARGET_PATH="$WORK/execprobe" RCC_REMOTE_PREFIXES="$STORE"
 REMOTE_EXEC="$(nsrun "$STORE" "$WORK/sup" "$WORK/execprobe" 2>&1 || true)"
 echo "routed-cwd exec: $REMOTE_EXEC"
 LOCAL_EXEC="$(cd "$WORK" && "$WORK/sup" "$WORK/execprobe" 2>&1 || true)"
 echo "local-cwd exec: $LOCAL_EXEC"
-unset RCC_SPAWN_PROXY RCC_CLAUDE_PATH
+unset RCC_SPAWN_PROXY RCC_TARGET_PATH
 
 echo "== the routed mount must be invisible outside the namespace =="
 # The mount shadows the run host's directory of the same name. Every other
