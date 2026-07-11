@@ -20,24 +20,44 @@ import (
 // The config home resolves to $envHome when that env var is set (and non-empty),
 // otherwise to ~/defaultDir. extraFiles are additional ~/-relative paths pinned
 // unconditionally alongside the config home (e.g. a top-level dot-file that lives
-// outside the config dir).
+// outside the config dir). absExtras are absolute, HOME-independent paths — the
+// engine's system-wide config folders (managed/enterprise policy) that it reads
+// "if present"; pinning a path that does not exist is harmless.
 type engineProfile struct {
 	envHome    string   // env var that overrides the config home dir ("" if none)
 	defaultDir string   // ~/-relative default config dir, e.g. ".claude"
 	extraFiles []string // additional ~/-relative files to pin local
+	absExtras  []string // absolute system paths to pin local (managed config, etc.)
 }
 
 // engineProfiles maps an engine name (the target command's basename) to its
-// profile. Verified against each engine's own config-home resolution:
+// profile. Verified against each engine's own config-home resolution and its
+// system-config lookup:
 //   - claude: envUtils.getClaudeConfigHomeDir = CLAUDE_CONFIG_DIR ?? ~/.claude,
-//     plus the separate global config file ~/.claude.json.
-//   - codex:  find_codex_home() = CODEX_HOME ?? ~/.codex; ALL codex state
+//     plus the separate global config file ~/.claude.json, plus the system-wide
+//     managed-settings.json (/etc/claude-code on Linux, /Library/Application
+//     Support/ClaudeCode on macOS — both pinned; the non-matching one is inert).
+//   - codex:  find_codex_home() = CODEX_HOME ?? ~/.codex; ALL user codex state
 //     (auth.json, config.toml, history.jsonl, sessions/, memories/, skills/,
 //     agents/, rules/, log/, caches, tmp/arg0) lives under that single dir, so
-//     there is no separate top-level dot-file to pin.
+//     there is no separate top-level dot-file. On Unix codex also reads the
+//     system config folder /etc/codex (config.toml, managed_config.toml,
+//     requirements.toml, skills/, rules/) "if present" — pinned via absExtras.
 var engineProfiles = map[string]engineProfile{
-	"claude": {envHome: "CLAUDE_CONFIG_DIR", defaultDir: ".claude", extraFiles: []string{".claude.json"}},
-	"codex":  {envHome: "CODEX_HOME", defaultDir: ".codex"},
+	"claude": {
+		envHome:    "CLAUDE_CONFIG_DIR",
+		defaultDir: ".claude",
+		extraFiles: []string{".claude.json"},
+		absExtras: []string{
+			"/etc/claude-code/managed-settings.json",
+			"/Library/Application Support/ClaudeCode/managed-settings.json",
+		},
+	},
+	"codex": {
+		envHome:    "CODEX_HOME",
+		defaultDir: ".codex",
+		absExtras:  []string{"/etc/codex"},
+	},
 }
 
 // detectProfile picks an engine profile from the target command. The command may
@@ -83,5 +103,8 @@ func profileLocalPrefixes(profile string) []string {
 			out = append(out, filepath.Join(home, f))
 		}
 	}
+
+	// Absolute system paths (managed/enterprise config) pin regardless of HOME.
+	out = append(out, p.absExtras...)
 	return out
 }
