@@ -72,6 +72,9 @@ after a literal -- is passed to <command> verbatim):
   --remote-prefix <path>  path prefix routed remote (repeatable; default: workdir)
   --local-prefix <path>   path prefix kept local under --default-remote (repeatable)
   --default-remote        route everything remote except --local-prefix paths
+  --profile <engine>      engine whose config home is pinned local under
+                          --default-remote (claude|codex; default: auto-detect
+                          from <command>)
   --resign / --resign=false
                           macOS: run an ad-hoc re-signed copy of <command> so the
                           interceptor dylib can load (default: true)

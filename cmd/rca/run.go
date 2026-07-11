@@ -40,6 +40,7 @@ type runOpts struct {
 	remotePrefixes []string
 	localPrefixes  []string
 	defaultRemote  bool
+	profile        string // engine profile for --default-remote local pins ("" = auto-detect from command)
 
 	resign      bool // macOS: run an ad-hoc re-signed copy (default true)
 	printCmd    bool
@@ -69,6 +70,7 @@ var ownedFlags = map[string]int{
 	"remote-prefix":  kindStringList,
 	"local-prefix":   kindStringList,
 	"default-remote": kindBool,
+	"profile":        kindString,
 	"resign":         kindBool,
 	"print-cmd":      kindBool,
 	"serve-fs-only":  kindBool,
@@ -98,6 +100,8 @@ func parseRunArgs(args []string) (*runOpts, error) {
 			o.sock = val
 		case "workdir":
 			o.workdir = val
+		case "profile":
+			o.profile = val
 		case "remote-prefix":
 			o.remotePrefixes = append(o.remotePrefixes, val)
 		case "local-prefix":
@@ -212,12 +216,20 @@ func cmdRun(args []string) int {
 	mode := routing.ModeRemoteAllowlist
 	if o.defaultRemote {
 		mode = routing.ModeLocalAllowlist
-		// Under default-remote, always keep claude's own config home and global
-		// config file local, even if the operator forgot to pass --local-prefix
-		// for them; otherwise claude's credential/session reads route remote.
-		if defs := defaultLocalPrefixes(); len(defs) > 0 {
-			logger.Printf("default-remote: pinning local prefixes %s", strings.Join(defs, ", "))
+		// Under default-remote, keep the engine's own config home (and any global
+		// config file) local, even if the operator forgot to pass --local-prefix
+		// for them; otherwise the engine's credential/session reads route remote
+		// and it cannot boot. The engine is picked from --profile, or auto-detected
+		// from the target command's basename (claude/codex).
+		profile := o.profile
+		if profile == "" {
+			profile = detectProfile(o.command)
+		}
+		if defs := profileLocalPrefixes(profile); len(defs) > 0 {
+			logger.Printf("default-remote: profile %q pinning local prefixes %s", profile, strings.Join(defs, ", "))
 			o.localPrefixes = append(defs, o.localPrefixes...)
+		} else {
+			logger.Printf("default-remote: no engine profile matched command %q — pass --profile or --local-prefix to keep engine state local", o.command)
 		}
 	} else if len(o.remotePrefixes) == 0 {
 		// Natural default: the directory you run rca in is the project that
@@ -452,26 +464,6 @@ func isMacOSPlatformBinary(path string) bool {
 
 func defaultAdapterSock() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("rcc-adapter-%d.sock", os.Getpid()))
-}
-
-// defaultLocalPrefixes returns the paths that must stay on the brain host under
-// --default-remote (ModeLocalAllowlist), regardless of operator config: claude's
-// config home (CLAUDE_CONFIG_DIR or ~/.claude — projects, plans, credentials,
-// settings) and its global config file ~/.claude.json. Without these, a
-// default-remote launch would forward claude's own credential/session reads to
-// the executor. Verified against claude's envUtils.getClaudeConfigHomeDir
-// (CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")).
-func defaultLocalPrefixes() []string {
-	var out []string
-	if cfg := os.Getenv("CLAUDE_CONFIG_DIR"); cfg != "" {
-		out = append(out, cfg)
-	} else if home := os.Getenv("HOME"); home != "" {
-		out = append(out, filepath.Join(home, ".claude"))
-	}
-	if home := os.Getenv("HOME"); home != "" {
-		out = append(out, filepath.Join(home, ".claude.json"))
-	}
-	return out
 }
 
 // resolvePrefixes resolves symlinks in each prefix (best effort). A prefix that

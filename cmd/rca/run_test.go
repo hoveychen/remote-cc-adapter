@@ -128,17 +128,17 @@ func TestParseRunArgs(t *testing.T) {
 }
 
 // routingTableForDefaults builds the ModeLocalAllowlist table run mode would
-// construct under --default-remote, seeded only with defaultLocalPrefixes.
+// construct under --default-remote for the claude profile.
 func routingTableForDefaults(t *testing.T) *routing.Table {
 	t.Helper()
-	return routing.New(routing.ModeLocalAllowlist, nil, defaultLocalPrefixes())
+	return routing.New(routing.ModeLocalAllowlist, nil, profileLocalPrefixes("claude"))
 }
 
-func TestDefaultLocalPrefixes(t *testing.T) {
+func TestProfileLocalPrefixes_claude(t *testing.T) {
 	t.Run("HOME set, no CLAUDE_CONFIG_DIR", func(t *testing.T) {
 		t.Setenv("HOME", "/home/alice")
 		t.Setenv("CLAUDE_CONFIG_DIR", "")
-		got := defaultLocalPrefixes()
+		got := profileLocalPrefixes("claude")
 		want := []string{"/home/alice/.claude", "/home/alice/.claude.json"}
 		assertPrefixes(t, got, want)
 	})
@@ -146,7 +146,7 @@ func TestDefaultLocalPrefixes(t *testing.T) {
 	t.Run("CLAUDE_CONFIG_DIR overrides config home", func(t *testing.T) {
 		t.Setenv("HOME", "/home/alice")
 		t.Setenv("CLAUDE_CONFIG_DIR", "/etc/claude")
-		got := defaultLocalPrefixes()
+		got := profileLocalPrefixes("claude")
 		// Config home comes from CLAUDE_CONFIG_DIR; ~/.claude.json still anchors to HOME.
 		want := []string{"/etc/claude", "/home/alice/.claude.json"}
 		assertPrefixes(t, got, want)
@@ -155,10 +155,67 @@ func TestDefaultLocalPrefixes(t *testing.T) {
 	t.Run("no HOME, no CLAUDE_CONFIG_DIR", func(t *testing.T) {
 		t.Setenv("HOME", "")
 		t.Setenv("CLAUDE_CONFIG_DIR", "")
-		if got := defaultLocalPrefixes(); len(got) != 0 {
+		if got := profileLocalPrefixes("claude"); len(got) != 0 {
 			t.Fatalf("want no defaults when nothing to anchor to, got %v", got)
 		}
 	})
+}
+
+func TestProfileLocalPrefixes_codex(t *testing.T) {
+	t.Run("HOME set, no CODEX_HOME", func(t *testing.T) {
+		t.Setenv("HOME", "/home/alice")
+		t.Setenv("CODEX_HOME", "")
+		got := profileLocalPrefixes("codex")
+		// All codex state lives under ~/.codex; no separate top-level dot-file.
+		want := []string{"/home/alice/.codex"}
+		assertPrefixes(t, got, want)
+	})
+
+	t.Run("CODEX_HOME replaces config home", func(t *testing.T) {
+		t.Setenv("HOME", "/home/alice")
+		t.Setenv("CODEX_HOME", "/srv/codex")
+		got := profileLocalPrefixes("codex")
+		want := []string{"/srv/codex"}
+		assertPrefixes(t, got, want)
+	})
+
+	t.Run("no HOME, no CODEX_HOME", func(t *testing.T) {
+		t.Setenv("HOME", "")
+		t.Setenv("CODEX_HOME", "")
+		if got := profileLocalPrefixes("codex"); len(got) != 0 {
+			t.Fatalf("want no defaults when nothing to anchor to, got %v", got)
+		}
+	})
+}
+
+func TestProfileLocalPrefixes_unknown(t *testing.T) {
+	t.Setenv("HOME", "/home/alice")
+	if got := profileLocalPrefixes("hermes"); len(got) != 0 {
+		t.Fatalf("unknown profile should yield no prefixes, got %v", got)
+	}
+	if got := profileLocalPrefixes(""); len(got) != 0 {
+		t.Fatalf("empty profile should yield no prefixes, got %v", got)
+	}
+}
+
+func TestDetectProfile(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+	}{
+		{"claude", "claude"},
+		{"codex", "codex"},
+		{"/usr/local/bin/codex", "codex"},
+		{"/opt/anthropic/claude", "claude"},
+		{"node", ""},
+		{"", ""},
+		{"codex-dev", ""}, // exact basename match only
+	}
+	for _, c := range cases {
+		if got := detectProfile(c.command); got != c.want {
+			t.Errorf("detectProfile(%q) = %q, want %q", c.command, got, c.want)
+		}
+	}
 }
 
 // TestDefaultLocalPrefixes_matcherBoundary guards the routing matcher's
