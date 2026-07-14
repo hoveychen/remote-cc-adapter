@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,6 +42,21 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 	binPath := req.Path
 	if binPath == "" {
 		binPath = req.Argv[0]
+	}
+	// PATH fallback: the client may reference a binary by an absolute path that
+	// exists on the brain host but not here — e.g. codex "code mode" always runs
+	// the client's login shell /bin/zsh, but a Linux executor keeps zsh at
+	// /usr/bin/zsh. When the exact path is absent, resolve the basename via this
+	// host's PATH so an equivalent binary is used. argv[0] is left untouched
+	// below, so the child still sees the original path (and rg-mode detection,
+	// which keys on argv[0]'s basename, is unaffected).
+	if strings.HasPrefix(binPath, "/") {
+		if _, statErr := os.Stat(binPath); statErr != nil {
+			if resolved, lookErr := exec.LookPath(filepath.Base(binPath)); lookErr == nil && resolved != binPath {
+				e.logf("[exec] path fallback: %s -> %s", binPath, resolved)
+				binPath = resolved
+			}
+		}
 	}
 	cmd := exec.Command(binPath)
 	cmd.Args = req.Argv
