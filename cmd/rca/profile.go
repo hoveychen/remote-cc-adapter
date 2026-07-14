@@ -39,11 +39,15 @@ type engineProfile struct {
 	// basenames resolved against the target binary's directory.
 	spawnHelpers []string
 
-	// osHintFlag is the CLI flag that appends extra text to the engine's system
-	// prompt, used to tell the agent that its routed subprocesses execute on the
-	// executor's OS rather than the local host it perceives. Empty when the
-	// engine exposes no such flag (then no arg-based hint is injected).
-	osHintFlag string
+	// osHintFlag / osHintValuePrefix describe how to append extra text to the
+	// engine's system prompt at launch, used to tell the agent that its routed
+	// subprocesses execute on the executor's OS rather than the local host it
+	// perceives. The injected argv is {osHintFlag, osHintValuePrefix + <text>}:
+	//   - claude: {"--append-system-prompt", "<text>"}      (flag takes the text directly)
+	//   - codex:  {"-c", "developer_instructions=<text>"}   (config override; value carries the key)
+	// osHintFlag empty means the engine has no injection mechanism (no hint).
+	osHintFlag        string
+	osHintValuePrefix string
 }
 
 // engineProfiles maps an engine name (the target command's basename) to its
@@ -74,18 +78,18 @@ var engineProfiles = map[string]engineProfile{
 		envHome:    "CODEX_HOME",
 		defaultDir: ".codex",
 		absExtras:  []string{"/etc/codex"},
-		// osHintFlag intentionally empty: codex has no --append-system-prompt (or
-		// --system-prompt) flag. Verified 2026-07 against the real codex-cli
-		// 0.144.4 binary — `codex --help` and `codex exec --help` expose only a
-		// positional [PROMPT] and -c/--config key=value; no prompt/instruction
-		// injection flag exists (matches the published CLI reference; the append
-		// flag is an open upstream request, openai/codex#11117). Its only
-		// persistent instruction surface is AGENTS.md, but injecting that means
-		// writing into the user's project dir (which routes remote and could
-		// clobber an existing file) or their global ~/.codex — both intrusive. So
-		// on a cross-OS codex launch run mode logs an actionable warning instead of
-		// silently doing the wrong thing; wire a real mechanism in when codex ships
-		// an append flag.
+		// codex has no --append-system-prompt flag, but `-c developer_instructions=`
+		// injects text into the developer message. Verified 2026-07 against the real
+		// codex-cli 0.144.4 binary: with `-c developer_instructions=MARK ...`, MARK
+		// lands in the role:developer entry of the session rollout, AND a project
+		// AGENTS.md still reaches the role:user entry — so this appends without
+		// clobbering the user's AGENTS.md. It is ephemeral (no file written), the
+		// codex analog of claude's --append-system-prompt. (`-c user_instructions=`
+		// and `-c system_prompt=` were tested and do NOT reach the prompt; only
+		// developer_instructions does. `-c base_instructions=` would replace codex's
+		// whole base prompt, so it is not used.)
+		osHintFlag:        "-c",
+		osHintValuePrefix: "developer_instructions=",
 		// codex 0.144.4+ "code mode" runs shell commands through a persistent
 		// sibling helper, codex-code-mode-host, which it execs from its own
 		// bin dir; that helper then spawns the actual shell (/bin/sh -lc ...).
@@ -173,7 +177,7 @@ func osHintArgs(profile, localOS, execOS, execArch string) []string {
 	if !ok || p.osHintFlag == "" {
 		return nil
 	}
-	return []string{p.osHintFlag, osHintText(execOS, execArch)}
+	return []string{p.osHintFlag, p.osHintValuePrefix + osHintText(execOS, execArch)}
 }
 
 // osHintText is the system-prompt addendum describing the real execution host.

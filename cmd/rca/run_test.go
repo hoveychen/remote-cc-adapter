@@ -302,15 +302,29 @@ func TestOSHintArgs(t *testing.T) {
 		}
 	})
 
-	t.Run("engine without a hint flag injects nothing", func(t *testing.T) {
+	t.Run("cross-OS codex gets a developer_instructions hint", func(t *testing.T) {
+		// codex has no --append-system-prompt flag, but `-c developer_instructions=`
+		// injects into the developer message (verified 2026-07 against codex-cli
+		// 0.144.4: the value reaches the role:developer prompt and coexists with
+		// AGENTS.md). It is the codex analog of claude's flag.
+		got := osHintArgs("codex", "darwin", "linux", "arm64")
+		if len(got) != 2 {
+			t.Fatalf("want [-c, developer_instructions=text], got %v", got)
+		}
+		if got[0] != "-c" {
+			t.Errorf("flag = %q, want -c", got[0])
+		}
+		if !strings.HasPrefix(got[1], "developer_instructions=") {
+			t.Errorf("value %q must start with developer_instructions=", got[1])
+		}
+		if !strings.Contains(got[1], "linux") || !strings.Contains(got[1], "arm64") {
+			t.Errorf("value %q must name the executor platform linux/arm64", got[1])
+		}
+	})
+
+	t.Run("engine without a hint mechanism injects nothing", func(t *testing.T) {
 		if got := osHintArgs("hermes", "darwin", "linux", "arm64"); got != nil {
 			t.Errorf("unknown engine should inject no hint, got %v", got)
-		}
-		// codex has no --append-system-prompt flag (verified 2026-07 against the
-		// real codex-cli 0.144.4 binary); the safe contract is to inject nothing
-		// and let run mode warn instead of guessing.
-		if got := osHintArgs("codex", "darwin", "linux", "arm64"); got != nil {
-			t.Errorf("codex has no injection flag; should inject no hint, got %v", got)
 		}
 	})
 }
