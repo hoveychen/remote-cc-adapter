@@ -443,7 +443,7 @@ func cmdRun(args []string) int {
 				o.args = append(hint, o.args...)
 				logger.Printf("cross-OS: agent on %s, executor on %s/%s — injected %s OS hint", runtime.GOOS, execOS, execArch, profileName)
 			} else {
-				logger.Printf("cross-OS: agent on %s, executor on %s/%s — no hint mechanism for profile %q; agent may emit wrong-platform commands", runtime.GOOS, execOS, execArch, profileName)
+				logger.Printf("cross-OS: agent on %s, executor on %s/%s — profile %q has no system-prompt injection flag; the agent may emit %s-wrong commands. Add a note to the engine's instructions (e.g. AGENTS.md) telling it commands run on %s.", runtime.GOOS, execOS, execArch, profileName, runtime.GOOS, execOS)
 			}
 		}
 	}

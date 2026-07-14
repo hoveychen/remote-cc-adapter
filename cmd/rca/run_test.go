@@ -306,5 +306,10 @@ func TestOSHintArgs(t *testing.T) {
 		if got := osHintArgs("hermes", "darwin", "linux", "arm64"); got != nil {
 			t.Errorf("unknown engine should inject no hint, got %v", got)
 		}
+		// codex has no --append-system-prompt flag (verified 2026-07); the safe
+		// contract is to inject nothing and let run mode warn instead of guessing.
+		if got := osHintArgs("codex", "darwin", "linux", "arm64"); got != nil {
+			t.Errorf("codex has no injection flag; should inject no hint, got %v", got)
+		}
 	})
 }
