@@ -21,6 +21,7 @@ func TestRequestRoundTrip(t *testing.T) {
 		{Op: OpRename, Path: "/work/a", Path2: "/work/b"},
 		{Op: OpSetattr, Path: "/work/f", Mask: SetMode | SetSize | SetAtime | SetMtime,
 			Mode: 0o600, Size: 1234, Atime: 1_700_000_000_000_000_001, Mtime: 1_700_000_000_000_000_002},
+		{Op: OpServerInfo},
 	}
 	for _, want := range cases {
 		var buf bytes.Buffer
@@ -62,6 +63,7 @@ func TestResponseRoundTrip(t *testing.T) {
 		{OpRename, &Response{}},
 		{OpSetattr, &Response{}},
 		{OpStat, &Response{Err: -2}}, // ENOENT: no payload beyond errno
+		{OpServerInfo, &Response{OS: "linux", Arch: "arm64"}},
 	}
 	for _, c := range cases {
 		var buf bytes.Buffer
@@ -73,7 +75,8 @@ func TestResponseRoundTrip(t *testing.T) {
 			t.Fatalf("%s: read: %v", c.op, err)
 		}
 		if got.Err != c.resp.Err || got.Mode != c.resp.Mode || got.Size != c.resp.Size ||
-			got.Handle != c.resp.Handle || got.Mtime != c.resp.Mtime || !bytes.Equal(got.Data, c.resp.Data) {
+			got.Handle != c.resp.Handle || got.Mtime != c.resp.Mtime || !bytes.Equal(got.Data, c.resp.Data) ||
+			got.OS != c.resp.OS || got.Arch != c.resp.Arch {
 			t.Errorf("%s: mismatch\n got=%+v\nwant=%+v", c.op, got, c.resp)
 		}
 		if len(got.Names) != len(c.resp.Names) {
