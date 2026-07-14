@@ -208,7 +208,14 @@ static int newslot(void) {
   close(ph);
   return -1;
 }
-static int slot(int fd) { for (int i = 0; i < MAXF; i++) if (tab[i].fd == fd) return i; return -1; }
+// slot maps a real fd back to its virtual-table index, or -1 if not ours. The
+// empty-slot sentinel is fd==0, which collides with real stdin (fd 0): a plain
+// scan would report stdin as a virtual slot and misroute reads on it through the
+// adapter. A virtual fd is always a placeholder from open("/dev/null"), which is
+// >=3 whenever the std streams are open, so fd<=0 is never one of ours. Guarding
+// it here is what lets codex-code-mode-host complete its stdin/stdout handshake
+// under interception (otherwise: "code-mode host exited during handshake").
+static int slot(int fd) { if (fd <= 0) return -1; for (int i = 0; i < MAXF; i++) if (tab[i].fd == fd) return i; return -1; }
 
 static void fillst(struct stat *s, long long sz, int dir) {
   memset(s, 0, sizeof *s);
@@ -477,7 +484,13 @@ int my_gde64(int fd, void *buf, size_t nbytes, long *basep) {
 // Extend via RCC_LOCAL_BINS (':'-joined substrings).
 static int spawn_is_local_bin(const char *path) {
   if (!path) return 0;
-  static const char *defaults[] = {"/usr/bin/security", "pbcopy", "tmux", NULL};
+  // codex-code-mode-host: codex's "code mode" shell helper. codex execs it from
+  // its own bin dir; it must run locally (a host-arch binary, and the adapter
+  // stages a re-signed copy next to the target — see run.go / profile.go), then
+  // its own /bin/sh children route remote by cwd. Without this it would hit the
+  // cwd-prefix rule below and be shipped to the executor, where it can't run.
+  static const char *defaults[] = {"/usr/bin/security", "pbcopy", "tmux",
+                                    "codex-code-mode-host", NULL};
   for (int i = 0; defaults[i]; i++)
     if (strstr(path, defaults[i])) return 1;
   // The spawn proxy (the rca binary) is matched by its full path from the env,
@@ -522,13 +535,13 @@ static int cwd_is_remote(void) {
 // The proxy rewrite preserves the ORIGINAL argv[0]: claude enters ripgrep mode
 // only when argv[0]'s basename is "rg", so the executor must exec the binary
 // with that argv[0] intact (see cmd/rca/spawnproxy.go, internal/execproto).
-int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
-                   const posix_spawnattr_t *at, char *const av[], char *const ev[]) {
-  const char *proxy = getenv("RCC_SPAWN_PROXY");
+// spawn_route computes whether a subprocess should run on the remote executor,
+// applying the precedence documented above. reason_out (optional) receives a
+// static reason string for logging. Shared by posix_spawn and the exec family.
+static int spawn_route(const char *path, char *const av[], const char **reason_out) {
   const char *sentinel = getenv("RCC_SPAWN_SENTINEL");
   int n = 0;
   while (av && av[n]) n++;
-
   // ripgrep-mode marker: --no-config is a ripgrep flag claude never uses in
   // agent mode. Only route it remote when the walk targets a remote project.
   int rgmode = 0;
@@ -549,26 +562,73 @@ int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_
     else if (is_remote(path)) { route = 1; reason = "target-prefix"; }
     else if (cwd_is_remote()) { route = 1; reason = "cwd-prefix"; }
   }
-  lg("SPAWN\ttarget=%s\troute=%d\treason=%s\targ0=%s\targ1=%s\n", path ? path : "?",
-     route, reason, (n > 0 && av[0]) ? av[0] : "", (n > 1 && av[1]) ? av[1] : "");
+  if (reason_out) *reason_out = reason;
+  return route;
+}
 
+// build_proxy_argv rewrites a child argv into the spawn-proxy form
+// [proxy, "_spawn-proxy", exec-path, argv0, argv1, ...] — exec-path is the real
+// binary; the rest is the child's full argv with argv[0] preserved. "_spawn-proxy"
+// selects the proxy subcommand inside the single rca binary (cmd/rca/spawnproxy.go).
+// Caller frees the returned array (the strings are borrowed, not copied).
+static char **build_proxy_argv(const char *proxy, const char *path, char *const av[]) {
+  int n = 0;
+  while (av && av[n]) n++;
+  char **na = calloc(n + 4, sizeof(char *));
+  int k = 0;
+  na[k++] = (char *)proxy;
+  na[k++] = "_spawn-proxy";
+  na[k++] = (char *)path;
+  for (int j = 0; j < n; j++) na[k++] = av[j];
+  na[k] = NULL;
+  return na;
+}
+
+int my_posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa,
+                   const posix_spawnattr_t *at, char *const av[], char *const ev[]) {
+  const char *proxy = getenv("RCC_SPAWN_PROXY");
+  const char *reason;
+  int route = spawn_route(path, av, &reason);
+  lg("SPAWN\ttarget=%s\troute=%d\treason=%s\targ0=%s\targ1=%s\n", path ? path : "?",
+     route, reason, (av && av[0]) ? av[0] : "", (av && av[0] && av[1]) ? av[1] : "");
   if (route && proxy && *proxy) {
-    // proxy argv: [rca, _spawn-proxy, exec-path, argv0, argv1, ...] — exec-path
-    // is the real binary; the rest is the child's full argv with argv[0]
-    // preserved. "_spawn-proxy" selects the proxy subcommand inside the single
-    // rca binary (cmd/rca/spawnproxy.go).
-    char **na = calloc(n + 4, sizeof(char *));
-    int k = 0;
-    na[k++] = (char *)proxy;
-    na[k++] = "_spawn-proxy";
-    na[k++] = (char *)path;
-    for (int j = 0; j < n; j++) na[k++] = av[j];
-    na[k] = NULL;
+    char **na = build_proxy_argv(proxy, path, av);
     int r = posix_spawn(pid, proxy, fa, at, na, ev);
     free(na);
     return r;
   }
   return posix_spawn(pid, path, fa, at, av, ev);
+}
+
+// exec family: codex's code-mode-host (its shell runner) launches the shell via
+// fork()+execve, NOT posix_spawn — so a shell command would escape routing if
+// only posix_spawn were hooked (verified: the /bin/zsh child never appeared in
+// the SPAWN log and ran locally). Apply the same routing to execve/execv/execvp:
+// on a remote-routed exec, replace this (already-forked) child with the spawn
+// proxy, so the command runs on the executor exactly as a posix_spawn child would.
+extern char **environ;
+static int do_execve(const char *path, char *const av[], char *const ev[]) {
+  const char *proxy = getenv("RCC_SPAWN_PROXY");
+  const char *reason;
+  int route = spawn_route(path, av, &reason);
+  lg("EXECVE\ttarget=%s\troute=%d\treason=%s\targ0=%s\n", path ? path : "?",
+     route, reason, (av && av[0]) ? av[0] : "");
+  if (route && proxy && *proxy) {
+    char **na = build_proxy_argv(proxy, path, av);
+    execve(proxy, na, ev); // replaces this process on success
+    free(na);              // only reached if execve failed
+    return -1;
+  }
+  return execve(path, av, ev);
+}
+int my_execve(const char *path, char *const av[], char *const ev[]) { return do_execve(path, av, ev); }
+int my_execv(const char *path, char *const av[]) { return do_execve(path, av, environ); }
+// execvp does a PATH search for bare names; only absolute/relative paths carry
+// enough information to route here, so pass bare names through to the real
+// execvp untouched (codex invokes the shell by absolute path, /bin/zsh).
+int my_execvp(const char *file, char *const av[]) {
+  if (file && strchr(file, '/')) return do_execve(file, av, environ);
+  return execvp(file, av);
 }
 
 // ---- interpose bindings ----------------------------------------------------
@@ -580,3 +640,4 @@ DI(my_write, write) DI(my_write_nc, write_nc) DI(my_pwrite, pwrite)
 DI(my_lseek, lseek) DI(my_close, close) DI(my_close_nc, close_nc) DI(my_gde64, gde64)
 DI(my_fcntl, fcntl)
 DI(my_posix_spawn, posix_spawn)
+DI(my_execve, execve) DI(my_execv, execv) DI(my_execvp, execvp)

@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/hoveychen/remote-adapter/internal/execproto"
@@ -61,13 +62,41 @@ func cmdSpawnProxy(args []string) int {
 		return 127
 	}
 
+	// Both the signal handler and the stdin pump write control frames to the
+	// same stream; serialize them.
+	var wmu sync.Mutex
+
 	// Forward SIGINT/SIGTERM to the remote child.
 	sigc := make(chan os.Signal, 4)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		for s := range sigc {
 			if sig, ok := s.(syscall.Signal); ok {
+				wmu.Lock()
 				_ = execproto.WriteSignal(stream, int32(sig))
+				wmu.Unlock()
+			}
+		}
+	}()
+
+	// Stream our stdin (the routed child's stdin) to the executor so a remote
+	// process that reads stdin — e.g. codex code mode's persistent `read line`
+	// shell — gets its input instead of blocking forever. A zero-length frame
+	// on EOF tells the executor to close the child's stdin.
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				wmu.Lock()
+				_ = execproto.WriteChunk(stream, execproto.TagStdin, buf[:n])
+				wmu.Unlock()
+			}
+			if err != nil {
+				wmu.Lock()
+				_ = execproto.WriteChunk(stream, execproto.TagStdin, nil)
+				wmu.Unlock()
+				return
 			}
 		}
 	}()

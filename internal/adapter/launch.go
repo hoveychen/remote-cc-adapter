@@ -111,12 +111,58 @@ func PrepareMacOSCopy(realTarget, dest string) (string, error) {
 		return "", fmt.Errorf("copy target binary: %w", err)
 	}
 	// Ad-hoc re-sign, dropping hardened runtime so DYLD_INSERT_LIBRARIES works.
-	// disable-library-validation is already set in the original entitlements.
-	sign := exec.Command("codesign", "--force", "--sign", "-", dest)
+	// Preserve the original entitlements: agent binaries (codex, its
+	// codex-code-mode-host helper) carry com.apple.security.cs.allow-jit and
+	// allow-unsigned-executable-memory because they run a JIT runtime. A plain
+	// `codesign --sign -` strips those, and the process is then killed the
+	// moment it allocates JIT memory — for code-mode-host that shows up as
+	// "code-mode host exited during handshake". Re-applying the extracted
+	// entitlements keeps the copy functional. (Library validation is not
+	// enforced under an ad-hoc signature without hardened runtime, so DYLD
+	// insertion still works regardless.)
+	args := []string{"--force", "--sign", "-"}
+	if ent, err := extractEntitlements(realTarget); err != nil {
+		return "", err
+	} else if ent != "" {
+		defer os.Remove(ent)
+		args = append(args, "--entitlements", ent)
+	}
+	args = append(args, dest)
+	sign := exec.Command("codesign", args...)
 	if out, err := sign.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("codesign: %w: %s", err, out)
 	}
 	return dest, nil
+}
+
+// extractEntitlements writes the binary's embedded entitlements to a temp plist
+// file suitable for `codesign --entitlements`, returning its path. It returns
+// ("", nil) when the binary carries no entitlements (nothing to preserve).
+func extractEntitlements(bin string) (string, error) {
+	// `-d --entitlements - --xml` prints the entitlements as an XML plist; a
+	// binary with none prints nothing (and exits 0).
+	out, err := exec.Command("codesign", "-d", "--entitlements", "-", "--xml", bin).Output()
+	if err != nil {
+		// No signature / no entitlements is not fatal — just nothing to carry.
+		return "", nil
+	}
+	if len(strings.TrimSpace(string(out))) == 0 || !strings.Contains(string(out), "<key>") {
+		return "", nil
+	}
+	f, err := os.CreateTemp("", "rcc-entitlements-*.plist")
+	if err != nil {
+		return "", fmt.Errorf("entitlements temp: %w", err)
+	}
+	if _, err := f.Write(out); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write entitlements: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("close entitlements: %w", err)
+	}
+	return f.Name(), nil
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {

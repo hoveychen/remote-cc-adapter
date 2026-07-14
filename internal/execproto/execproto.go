@@ -6,7 +6,8 @@
 // §4.1 point 4), promoted to a typed Go codec:
 //
 //	proxy -> executor : one framed SpawnRequest (uint32 len + JSON), then zero or
-//	                    more control frames (currently just signal forwarding).
+//	                    more control frames — signal forwarding and stdin chunks
+//	                    (a zero-length stdin frame signals EOF).
 //	executor -> proxy : a stream of tagged frames — stdout/stderr chunks, then a
 //	                    final exit frame carrying the child's exit code.
 //
@@ -27,6 +28,7 @@ const (
 	TagStderr byte = 'E' // executor -> proxy: stderr chunk
 	TagExit   byte = 'X' // executor -> proxy: final exit code (int32)
 	TagSignal byte = 'S' // proxy -> executor: forward a signal (int32 signum)
+	TagStdin  byte = 'I' // proxy -> executor: stdin chunk; a zero-length frame means EOF
 )
 
 // MaxChunk caps a single stream chunk.

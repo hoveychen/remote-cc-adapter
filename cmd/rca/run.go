@@ -267,11 +267,36 @@ func cmdRun(args []string) int {
 				return 1
 			}
 			dest := filepath.Join(filepath.Dir(o.adapterSock), "rcc-"+filepath.Base(target)+"-copy")
-			if target, err = adapter.PrepareMacOSCopy(target, dest); err != nil {
+			realTarget := target
+			if target, err = adapter.PrepareMacOSCopy(realTarget, dest); err != nil {
 				logger.Printf("prepare re-signed copy: %v", err)
 				return 1
 			}
 			logger.Printf("re-signed copy at %s", target)
+
+			// Some engines (codex) spawn a sibling helper binary they resolve
+			// relative to their own executable dir (e.g. codex-code-mode-host,
+			// which runs the shell tool). Since the target now runs from an
+			// isolated copy dir, that sibling is absent there — copy+re-sign each
+			// declared helper next to the copy so the engine finds it and the
+			// interceptor keeps it local (see spawn_is_local_bin, profile.go).
+			profileName := o.profile
+			if profileName == "" {
+				profileName = detectProfile(o.command)
+			}
+			for _, h := range profileSpawnHelpers(profileName) {
+				src := filepath.Join(filepath.Dir(realTarget), h)
+				if _, statErr := os.Stat(src); statErr != nil {
+					logger.Printf("engine helper %q not found next to %s (%v) — skipping", h, realTarget, statErr)
+					continue
+				}
+				hdest := filepath.Join(filepath.Dir(dest), h)
+				if _, err = adapter.PrepareMacOSCopy(src, hdest); err != nil {
+					logger.Printf("prepare re-signed helper %q: %v", h, err)
+					return 1
+				}
+				logger.Printf("re-signed engine helper at %s", hdest)
+			}
 		}
 	}
 

@@ -74,7 +74,7 @@ run_codex() {
       --skip-git-repo-check \
       --color never \
       -C "$VFS" \
-      "${model_args[@]}" \
+      ${model_args[@]+"${model_args[@]}"} \
       -o "$last" \
       "$prompt"
 }
@@ -94,15 +94,19 @@ echo "codex said: $OUT2"
 echo
 echo "===== VERDICT ====="
 PASS=1
-# Match on the basename: paths in the log are symlink-canonical (e.g. macOS
-# /tmp -> /private/tmp), so an exact $ROUTED_FILE match would spuriously miss.
-if grep -qE "OPEN .*/$(basename "$ROUTED_FILE")" "$EXEC_LOG" && grep -q "PREAD" "$EXEC_LOG"; then
-  echo "[PASS] file Read routed through executor RPC (OPEN+PREAD in executor log)"
+# Unlike claude's Read tool (which fetches the file over the adapter fs-RPC,
+# leaving OPEN/PREAD in the executor log), codex has no Read tool: it reads a
+# file by running a shell `cat` ON the executor, which opens the executor-local
+# file directly. So the remote evidence for TEST 1 is that codex's shell itself
+# ran on the executor — plus the marker flowing back proves the content came
+# from there.
+if grep -qE "\[exec\] spawn" "$EXEC_LOG"; then
+  echo "[PASS] codex's shell ran on the executor (routed read served there)"
 else
-  echo "[FAIL] no executor RPC evidence for the routed Read"; PASS=0
+  echo "[FAIL] no executor exec evidence — codex's shell did not route remote"; PASS=0
 fi
 if echo "$OUT1" | grep -q "$MARKER"; then
-  echo "[PASS] codex returned the marker via the redirected Read"
+  echo "[PASS] codex returned the marker via the redirected read"
 else
   echo "[WARN] marker not found in codex output (model phrasing/refusal?) — check log above"
 fi

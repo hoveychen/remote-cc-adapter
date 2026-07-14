@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,6 +43,21 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 	if binPath == "" {
 		binPath = req.Argv[0]
 	}
+	// PATH fallback: the client may reference a binary by an absolute path that
+	// exists on the brain host but not here — e.g. codex "code mode" always runs
+	// the client's login shell /bin/zsh, but a Linux executor keeps zsh at
+	// /usr/bin/zsh. When the exact path is absent, resolve the basename via this
+	// host's PATH so an equivalent binary is used. argv[0] is left untouched
+	// below, so the child still sees the original path (and rg-mode detection,
+	// which keys on argv[0]'s basename, is unaffected).
+	if strings.HasPrefix(binPath, "/") {
+		if _, statErr := os.Stat(binPath); statErr != nil {
+			if resolved, lookErr := exec.LookPath(filepath.Base(binPath)); lookErr == nil && resolved != binPath {
+				e.logf("[exec] path fallback: %s -> %s", binPath, resolved)
+				binPath = resolved
+			}
+		}
+	}
 	cmd := exec.Command(binPath)
 	cmd.Args = req.Argv
 	cmd.Dir = req.Cwd
@@ -71,6 +87,14 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 		_ = execproto.WriteExit(stream, 127)
 		return
 	}
+	// A stdin pipe so the proxy can stream the child's stdin. codex "code mode"
+	// runs a persistent shell that reads commands from stdin (`read line`); with
+	// no stdin channel that shell blocks forever and the whole exec hangs.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = execproto.WriteExit(stream, 127)
+		return
+	}
 	if err := cmd.Start(); err != nil {
 		e.logf("[exec] start: %v", err)
 		_ = execproto.WriteExit(stream, 127)
@@ -91,19 +115,31 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 	go pump(stdout, execproto.TagStdout, writeChunk, &wg)
 	go pump(stderr, execproto.TagStderr, writeChunk, &wg)
 
-	// Forward signals the proxy relays until the control stream closes.
+	// Read control frames the proxy relays until the control stream closes:
+	// signal forwarding and stdin chunks. Closing stdin on EOF (a zero-length
+	// stdin frame) or on stream close lets a child blocked on `read` finish.
 	go func() {
+		defer stdin.Close()
 		for {
 			f, err := execproto.ReadFrame(br)
 			if err != nil {
 				return
 			}
-			if f.Tag == execproto.TagSignal && cmd.Process != nil {
-				// Signal the whole process group (negative pid) so children die
-				// too; fall back to the leader if the group send fails.
-				sig := syscall.Signal(f.Signum())
-				if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
-					_ = cmd.Process.Signal(sig)
+			switch f.Tag {
+			case execproto.TagSignal:
+				if cmd.Process != nil {
+					// Signal the whole process group (negative pid) so children
+					// die too; fall back to the leader if the group send fails.
+					sig := syscall.Signal(f.Signum())
+					if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
+						_ = cmd.Process.Signal(sig)
+					}
+				}
+			case execproto.TagStdin:
+				if len(f.Data) == 0 {
+					_ = stdin.Close() // EOF: no more input for the child
+				} else {
+					_, _ = stdin.Write(f.Data)
 				}
 			}
 		}
