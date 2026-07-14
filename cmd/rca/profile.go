@@ -28,6 +28,15 @@ type engineProfile struct {
 	defaultDir string   // ~/-relative default config dir, e.g. ".claude"
 	extraFiles []string // additional ~/-relative files to pin local
 	absExtras  []string // absolute system paths to pin local (managed config, etc.)
+	// spawnHelpers are sibling binaries the engine spawns that live next to its
+	// own executable and must run on the local (brain) host — not the remote
+	// executor — even when the working directory routes remote. The engine
+	// resolves them relative to its own argv[0] dir, so on macOS the adapter
+	// copies+re-signs each one next to the target's re-signed copy (see
+	// cmd/rca/run.go). The interceptor keeps them local by basename (see
+	// spawn_is_local_bin in native/macos/rcc_interpose.c). Names are bare
+	// basenames resolved against the target binary's directory.
+	spawnHelpers []string
 }
 
 // engineProfiles maps an engine name (the target command's basename) to its
@@ -57,6 +66,12 @@ var engineProfiles = map[string]engineProfile{
 		envHome:    "CODEX_HOME",
 		defaultDir: ".codex",
 		absExtras:  []string{"/etc/codex"},
+		// codex 0.144.4+ "code mode" runs shell commands through a persistent
+		// sibling helper, codex-code-mode-host, which it execs from its own
+		// bin dir; that helper then spawns the actual shell (/bin/sh -lc ...).
+		// The helper must stay local (it's a host-arch binary) so its shell
+		// children route remote by cwd like any other subprocess.
+		spawnHelpers: []string{"codex-code-mode-host"},
 	},
 }
 
@@ -107,4 +122,15 @@ func profileLocalPrefixes(profile string) []string {
 	// Absolute system paths (managed/enterprise config) pin regardless of HOME.
 	out = append(out, p.absExtras...)
 	return out
+}
+
+// profileSpawnHelpers returns the bare basenames of sibling helper binaries the
+// named engine spawns that must run on the local host. Empty for an unknown
+// profile or an engine with no such helpers.
+func profileSpawnHelpers(profile string) []string {
+	p, ok := engineProfiles[profile]
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), p.spawnHelpers...)
 }

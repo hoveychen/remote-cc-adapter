@@ -477,7 +477,13 @@ int my_gde64(int fd, void *buf, size_t nbytes, long *basep) {
 // Extend via RCC_LOCAL_BINS (':'-joined substrings).
 static int spawn_is_local_bin(const char *path) {
   if (!path) return 0;
-  static const char *defaults[] = {"/usr/bin/security", "pbcopy", "tmux", NULL};
+  // codex-code-mode-host: codex's "code mode" shell helper. codex execs it from
+  // its own bin dir; it must run locally (a host-arch binary, and the adapter
+  // stages a re-signed copy next to the target — see run.go / profile.go), then
+  // its own /bin/sh children route remote by cwd. Without this it would hit the
+  // cwd-prefix rule below and be shipped to the executor, where it can't run.
+  static const char *defaults[] = {"/usr/bin/security", "pbcopy", "tmux",
+                                    "codex-code-mode-host", NULL};
   for (int i = 0; defaults[i]; i++)
     if (strstr(path, defaults[i])) return 1;
   // The spawn proxy (the rca binary) is matched by its full path from the env,
