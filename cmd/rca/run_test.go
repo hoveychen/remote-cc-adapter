@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/hoveychen/remote-adapter/internal/routing"
@@ -260,4 +261,56 @@ func assertPrefixes(t *testing.T, got, want []string) {
 			t.Errorf("prefix[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// TestOSHintArgs reproduces the cross-OS command-mismatch bug: run mode launches
+// the agent on the local host (so its environment block reports the local OS),
+// but routed subprocesses execute on the executor. When the two differ, the
+// agent must be told the real execution platform, or it emits wrong-flavour
+// commands (BSD sed/ls on a GNU/Linux executor) that fail repeatedly.
+func TestOSHintArgs(t *testing.T) {
+	t.Run("cross-OS claude gets an informative hint", func(t *testing.T) {
+		got := osHintArgs("claude", "darwin", "linux", "arm64")
+		if len(got) != 2 {
+			t.Fatalf("want [flag, text], got %v", got)
+		}
+		if got[0] != "--append-system-prompt" {
+			t.Errorf("flag = %q, want --append-system-prompt", got[0])
+		}
+		// The hint must actually name the executor's platform so the model knows
+		// which command dialect to use — an empty/placeholder string is the bug.
+		if !strings.Contains(got[1], "linux") {
+			t.Errorf("hint text %q does not mention the executor OS %q", got[1], "linux")
+		}
+		if !strings.Contains(got[1], "arm64") {
+			t.Errorf("hint text %q does not mention the executor arch %q", got[1], "arm64")
+		}
+	})
+
+	t.Run("same OS injects nothing", func(t *testing.T) {
+		if got := osHintArgs("claude", "linux", "linux", "amd64"); got != nil {
+			t.Errorf("same-OS deployment should inject no hint, got %v", got)
+		}
+		if got := osHintArgs("claude", "darwin", "darwin", "arm64"); got != nil {
+			t.Errorf("same-OS deployment should inject no hint, got %v", got)
+		}
+	})
+
+	t.Run("unknown executor OS injects nothing", func(t *testing.T) {
+		if got := osHintArgs("claude", "darwin", "", ""); got != nil {
+			t.Errorf("unknown executor OS should inject no hint, got %v", got)
+		}
+	})
+
+	t.Run("engine without a hint flag injects nothing", func(t *testing.T) {
+		if got := osHintArgs("hermes", "darwin", "linux", "arm64"); got != nil {
+			t.Errorf("unknown engine should inject no hint, got %v", got)
+		}
+		// codex has no --append-system-prompt flag (verified 2026-07 against the
+		// real codex-cli 0.144.4 binary); the safe contract is to inject nothing
+		// and let run mode warn instead of guessing.
+		if got := osHintArgs("codex", "darwin", "linux", "arm64"); got != nil {
+			t.Errorf("codex has no injection flag; should inject no hint, got %v", got)
+		}
+	})
 }

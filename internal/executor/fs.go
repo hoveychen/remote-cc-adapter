@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -57,6 +58,8 @@ func (s *FSService) Handle(req *protocol.Request) *protocol.Response {
 		return s.rename(req)
 	case protocol.OpSetattr:
 		return s.setattr(req)
+	case protocol.OpServerInfo:
+		return &protocol.Response{OS: runtime.GOOS, Arch: runtime.GOARCH}
 	default:
 		return &protocol.Response{Err: -int32(syscall.EINVAL)}
 	}

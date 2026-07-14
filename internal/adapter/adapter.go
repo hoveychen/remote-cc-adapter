@@ -16,6 +16,7 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"syscall"
@@ -82,6 +83,36 @@ func (a *Adapter) logf(format string, args ...any) {
 	if a.logger != nil {
 		a.logger.Printf(format, args...)
 	}
+}
+
+// QueryServerInfo asks the executor for its GOOS/GOARCH over a one-shot fs
+// stream. It is used before launching the agent to decide whether the agent's
+// perceived OS (the local host the CLI runs on) differs from where its routed
+// subprocesses actually execute. An executor built before OpServerInfo hits its
+// ReadRequest default and closes the stream; that surfaces here as an error and
+// the caller skips the hint rather than failing the launch — so a new run
+// client still talks to an old `rca serve`.
+func QueryServerInfo(ctx context.Context, dialer transport.Dialer) (osName, arch string, err error) {
+	stream, err := dialer.Dial(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("dial executor: %w", err)
+	}
+	defer stream.Close()
+	if _, err := stream.Write([]byte{executor.StreamKindFS}); err != nil {
+		return "", "", fmt.Errorf("write stream kind: %w", err)
+	}
+	conn := protocol.NewConn(stream)
+	if err := conn.SendRequest(&protocol.Request{Op: protocol.OpServerInfo}); err != nil {
+		return "", "", fmt.Errorf("send server-info: %w", err)
+	}
+	resp, err := conn.ReadResponse(protocol.OpServerInfo)
+	if err != nil {
+		return "", "", fmt.Errorf("read server-info: %w", err)
+	}
+	if resp.Err != 0 {
+		return "", "", fmt.Errorf("executor server-info errno %d", resp.Err)
+	}
+	return resp.OS, resp.Arch, nil
 }
 
 // handleRef records which side an adapter handle lives on and its side-local id.

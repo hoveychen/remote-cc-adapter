@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -139,6 +140,42 @@ func TestAdapterRoutesLocalAndRemote(t *testing.T) {
 	}
 	if _, err := os.Stat(newPath); err != nil {
 		t.Fatalf("source vanished on a refused rename: %v", err)
+	}
+}
+
+// TestQueryServerInfo verifies the adapter can read the executor's GOOS/GOARCH
+// over a one-shot fs stream — the signal run mode uses to detect a cross-OS
+// deployment (agent host != executor host) before launching the agent.
+func TestQueryServerInfo(t *testing.T) {
+	sockDir, err := os.MkdirTemp("/tmp", "rcc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	execSock := filepath.Join(sockDir, "exec.sock")
+	execLn, err := transport.ListenUnix(execSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer execLn.Close()
+	go executor.New(execLn, testLogger{t}).Serve()
+
+	// Retry the dial: the executor's Accept loop may not be running yet.
+	var gotOS, gotArch string
+	for i := 0; i < 50; i++ {
+		gotOS, gotArch, err = QueryServerInfo(t.Context(), transport.NewUnixDialer(execSock))
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("QueryServerInfo: %v", err)
+	}
+	// The executor runs in this test process, so its OS/arch is ours.
+	if gotOS != runtime.GOOS || gotArch != runtime.GOARCH {
+		t.Fatalf("got os=%q arch=%q, want os=%q arch=%q", gotOS, gotArch, runtime.GOOS, runtime.GOARCH)
 	}
 }
 

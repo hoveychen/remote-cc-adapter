@@ -10,6 +10,7 @@ package main
 // work; everything after a literal `--` is passed to <command> verbatim.
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/hoveychen/remote-adapter/internal/adapter"
 	"github.com/hoveychen/remote-adapter/internal/paircode"
@@ -413,6 +415,37 @@ func cmdRun(args []string) int {
 		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 		<-sigc
 		return 0
+	}
+
+	// Cross-OS deployment: the agent launches on THIS host and its environment
+	// block reports this OS, but its routed subprocesses execute on the executor.
+	// When the two differ (e.g. macOS agent, Linux executor), prepend an
+	// engine-specific system-prompt hint so the agent writes commands for the
+	// executor's platform instead of the local one — otherwise it emits
+	// wrong-dialect commands (BSD sed/ls on GNU/Linux) that fail repeatedly. The
+	// probe is best-effort: on any failure (short timeout, or an old executor
+	// that predates OpServerInfo) we skip the hint rather than block the launch.
+	{
+		qctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		execOS, execArch, qerr := adapter.QueryServerInfo(qctx, dialer)
+		cancel()
+		switch {
+		case qerr != nil:
+			logger.Printf("executor OS probe failed (%v) — skipping cross-OS hint", qerr)
+		case execOS == runtime.GOOS:
+			// Same-OS deployment (incl. co-located): nothing to reconcile.
+		default:
+			profileName := o.profile
+			if profileName == "" {
+				profileName = detectProfile(o.command)
+			}
+			if hint := osHintArgs(profileName, runtime.GOOS, execOS, execArch); len(hint) > 0 {
+				o.args = append(hint, o.args...)
+				logger.Printf("cross-OS: agent on %s, executor on %s/%s — injected %s OS hint", runtime.GOOS, execOS, execArch, profileName)
+			} else {
+				logger.Printf("cross-OS: agent on %s, executor on %s/%s — profile %q has no system-prompt injection flag; the agent may emit %s-wrong commands. Add a note to the engine's instructions (e.g. AGENTS.md) telling it commands run on %s.", runtime.GOOS, execOS, execArch, profileName, runtime.GOOS, execOS)
+			}
+		}
 	}
 
 	// Build and spawn the intercepted target process.

@@ -52,6 +52,14 @@ const (
 	OpMkdir   Op = 10 // create a directory
 	OpRename  Op = 11 // rename Path -> Path2
 	OpSetattr Op = 12 // change mode/size/times per Mask
+
+	// OpServerInfo asks the executor to describe its host: GOOS/GOARCH. The
+	// adapter sends it once before launching the agent so it can tell the agent
+	// which OS its routed subprocesses actually run on. An executor built before
+	// this op existed hits ReadRequest's default and errors the stream; the
+	// caller treats that as "unknown" and simply skips the hint (see
+	// QueryServerInfo), so a new run client still talks to an old `rca serve`.
+	OpServerInfo Op = 13 // report executor GOOS/GOARCH
 )
 
 // UnlinkRmdir makes OpUnlink remove a directory instead of a file. The two are
@@ -94,6 +102,8 @@ func (o Op) String() string {
 		return "RENAME"
 	case OpSetattr:
 		return "SETATTR"
+	case OpServerInfo:
+		return "SERVERINFO"
 	default:
 		return fmt.Sprintf("OP(%d)", uint8(o))
 	}
@@ -129,6 +139,8 @@ type Response struct {
 	Data   []byte   // OpPread: bytes read
 	Names  []string // OpReaddir: entry names
 	Types  []uint8  // OpReaddir: per-entry POSIX d_type (parallel to Names)
+	OS     string   // OpServerInfo: executor runtime.GOOS
+	Arch   string   // OpServerInfo: executor runtime.GOARCH
 }
 
 // POSIX d_type values carried per entry in a READDIR response (BSD/Linux
@@ -299,6 +311,8 @@ func WriteRequest(w io.Writer, req *Request) error {
 		e.i64(req.Size)
 		e.i64(req.Atime)
 		e.i64(req.Mtime)
+	case OpServerInfo:
+		// No op-specific request fields; the op byte alone is the query.
 	default:
 		return fmt.Errorf("protocol: unknown request op %d", req.Op)
 	}
@@ -352,6 +366,8 @@ func ReadRequest(r io.Reader) (*Request, error) {
 		req.Size = p.i64()
 		req.Atime = p.i64()
 		req.Mtime = p.i64()
+	case OpServerInfo:
+		// No op-specific request fields to decode.
 	default:
 		return nil, fmt.Errorf("protocol: unknown request op %d", req.Op)
 	}
@@ -393,6 +409,9 @@ func WriteResponse(w io.Writer, op Op, resp *Response) error {
 				}
 				e.u8(t)
 			}
+		case OpServerInfo:
+			e.str(resp.OS)
+			e.str(resp.Arch)
 		case OpWriteFile, OpClose, OpUnlink, OpMkdir, OpRename, OpSetattr:
 			// errno only
 		}
@@ -432,6 +451,9 @@ func ReadResponse(r io.Reader, op Op) (*Response, error) {
 				resp.Names = append(resp.Names, p.str())
 				resp.Types = append(resp.Types, p.u8())
 			}
+		case OpServerInfo:
+			resp.OS = p.str()
+			resp.Arch = p.str()
 		case OpWriteFile, OpClose, OpUnlink, OpMkdir, OpRename, OpSetattr:
 		}
 	}
