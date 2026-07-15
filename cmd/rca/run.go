@@ -439,11 +439,19 @@ func cmdRun(args []string) int {
 			if profileName == "" {
 				profileName = detectProfile(o.command)
 			}
-			if hint := osHintArgs(profileName, runtime.GOOS, execOS, execArch); len(hint) > 0 {
-				o.args = append(hint, o.args...)
-				logger.Printf("cross-OS: agent on %s, executor on %s/%s — injected %s OS hint", runtime.GOOS, execOS, execArch, profileName)
+			// Two independent cross-OS adjustments, both prepended to the engine's
+			// args: (1) a system-prompt hint so the agent writes commands for the
+			// executor's OS; (2) engine args needed to FUNCTION cross-OS, e.g.
+			// disabling codex's macOS sandbox whose /usr/bin/sandbox-exec wrapper
+			// 127s on a Linux executor.
+			hint := osHintArgs(profileName, runtime.GOOS, execOS, execArch)
+			extra := profileCrossOSExtraArgs(profileName)
+			inject := append(append([]string(nil), hint...), extra...)
+			if len(inject) > 0 {
+				o.args = append(inject, o.args...)
+				logger.Printf("cross-OS: agent on %s, executor on %s/%s — for %q injected OS hint=%t extra=%v", runtime.GOOS, execOS, execArch, profileName, len(hint) > 0, extra)
 			} else {
-				logger.Printf("cross-OS: agent on %s, executor on %s/%s — profile %q has no system-prompt injection flag; the agent may emit %s-wrong commands. Add a note to the engine's instructions (e.g. AGENTS.md) telling it commands run on %s.", runtime.GOOS, execOS, execArch, profileName, runtime.GOOS, execOS)
+				logger.Printf("cross-OS: agent on %s, executor on %s/%s — profile %q has no cross-OS handling; the agent may emit %s-wrong commands or its local sandbox may fail on the executor. Add a note to the engine's instructions (e.g. AGENTS.md) telling it commands run on %s.", runtime.GOOS, execOS, execArch, profileName, runtime.GOOS, execOS)
 			}
 		}
 	}
