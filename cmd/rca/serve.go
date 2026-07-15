@@ -62,6 +62,14 @@ func cmdServe(args []string) int {
 	defer ln.Close()
 
 	exe := executor.New(ln, logger)
+	// Stage the bundled ripgrep (make rg) so a cross-OS claude's rg spawns — which
+	// reference its own host-OS binary, absent here — run against a matching rg.
+	if rg, err := extractEmbeddedNative("rg"); err != nil {
+		logger.Printf("bundled ripgrep unavailable (%v); cross-OS rg spawns fall back to this host's rg", err)
+	} else if rg != "" {
+		exe.SetEmbeddedRg(rg)
+		logger.Printf("bundled ripgrep for cross-OS rg spawns: %s", rg)
+	}
 	logger.Printf("serving on %s", ln.Addr())
 	if err := exe.Serve(); err != nil {
 		logger.Printf("serve: %v", err)

@@ -26,7 +26,7 @@ mkdir -p "$DIST"
 
 # go:embed picks up EVERYTHING in embedded/ — drop stale artifacts (e.g. the
 # other platform's, from a previous local build) so archives stay minimal.
-rm -f "$EMBED/rcc_interpose.dylib" "$EMBED/rcc_seccomp"
+rm -f "$EMBED/rcc_interpose.dylib" "$EMBED/rcc_seccomp" "$EMBED/rg"
 
 # Archive names carry no version (rca_darwin_arm64.tar.gz) so install
 # one-liners can use GitHub's releases/latest/download/ URLs; the version is
@@ -34,6 +34,9 @@ rm -f "$EMBED/rcc_interpose.dylib" "$EMBED/rcc_seccomp"
 build_go() { # $1=goos $2=goarch
   local out="$DIST/rca"
   rm -f "$out"
+  # Stage the static ripgrep matching this target so the executor can run a
+  # cross-OS claude's rg spawns (see internal/executor/exec.go, Makefile `rg`).
+  GOOS="$1" GOARCH="$2" make -C "$REPO" rg >/dev/null
   # -buildvcs=false: version comes from ldflags; VCS stamping would fail in
   # containers/worktrees where .git isn't fully visible.
   CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$out" ./cmd/rca

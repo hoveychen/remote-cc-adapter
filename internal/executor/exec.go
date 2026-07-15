@@ -14,6 +14,51 @@ import (
 	"github.com/hoveychen/remote-adapter/internal/execproto"
 )
 
+// resolveBinPath picks the binary to exec for a routed spawn on this host.
+//
+// It prefers reqPath. When reqPath is an absolute path absent on this host it
+// falls back, in order, to: the path's own basename on PATH (e.g. codex's
+// /bin/zsh -> /usr/bin/zsh on a distro that keeps it elsewhere); argv[0]'s
+// basename on PATH (claude re-execs its own host-OS binary with argv[0]=rg, so
+// the useful identity is "rg", not the copy's basename); and a bundled ripgrep
+// for an rg spawn when this host has no rg of its own. Returns reqPath (or
+// argv[0] when reqPath is empty, for older proxies) when nothing better resolves.
+func resolveBinPath(reqPath string, argv []string, embeddedRg string) string {
+	return resolveBinPathWith(reqPath, argv, embeddedRg, os.Stat, exec.LookPath)
+}
+
+// resolveBinPathWith is resolveBinPath with the filesystem/PATH lookups injected
+// so the resolution order is unit-testable independent of the test host.
+func resolveBinPathWith(reqPath string, argv []string, embeddedRg string,
+	stat func(string) (os.FileInfo, error), lookPath func(string) (string, error)) string {
+	binPath := reqPath
+	if binPath == "" && len(argv) > 0 {
+		binPath = argv[0]
+	}
+	if !strings.HasPrefix(binPath, "/") {
+		return binPath // a bare name; the child's own PATH search applies
+	}
+	if _, err := stat(binPath); err == nil {
+		return binPath // present here, use as-is
+	}
+	if resolved, err := lookPath(filepath.Base(binPath)); err == nil && resolved != binPath {
+		return resolved
+	}
+	var arg0Base string
+	if len(argv) > 0 {
+		arg0Base = filepath.Base(argv[0])
+	}
+	if arg0Base != "" {
+		if resolved, err := lookPath(arg0Base); err == nil {
+			return resolved
+		}
+	}
+	if arg0Base == "rg" && embeddedRg != "" {
+		return embeddedRg
+	}
+	return binPath
+}
+
 // serveExec runs one subprocess on the executor host on behalf of a connected
 // spawn proxy. It reads the SpawnRequest header, launches the process, pumps
 // stdout/stderr back as tagged frames, forwards signals the proxy relays, and
@@ -35,28 +80,16 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 	}
 	e.logf("[exec] spawn path=%s argv=%v cwd=%s", req.Path, req.Argv, req.Cwd)
 
-	// Preserve argv[0]: run req.Path (the binary) with the full req.Argv as the
-	// argument vector, so argv[0] reaches the child verbatim (claude enters
-	// ripgrep mode only when argv[0]'s basename is "rg"). Fall back to Argv[0] as
-	// the path when Path is unset (older proxy).
-	binPath := req.Path
-	if binPath == "" {
-		binPath = req.Argv[0]
+	// Resolve the binary to exec. argv[0] is preserved verbatim in cmd.Args below
+	// (claude enters ripgrep mode only when argv[0]'s basename is "rg"), so
+	// rewriting only the path is safe.
+	binPath := resolveBinPath(req.Path, req.Argv, e.embeddedRg)
+	orig := req.Path
+	if orig == "" && len(req.Argv) > 0 {
+		orig = req.Argv[0]
 	}
-	// PATH fallback: the client may reference a binary by an absolute path that
-	// exists on the brain host but not here — e.g. codex "code mode" always runs
-	// the client's login shell /bin/zsh, but a Linux executor keeps zsh at
-	// /usr/bin/zsh. When the exact path is absent, resolve the basename via this
-	// host's PATH so an equivalent binary is used. argv[0] is left untouched
-	// below, so the child still sees the original path (and rg-mode detection,
-	// which keys on argv[0]'s basename, is unaffected).
-	if strings.HasPrefix(binPath, "/") {
-		if _, statErr := os.Stat(binPath); statErr != nil {
-			if resolved, lookErr := exec.LookPath(filepath.Base(binPath)); lookErr == nil && resolved != binPath {
-				e.logf("[exec] path fallback: %s -> %s", binPath, resolved)
-				binPath = resolved
-			}
-		}
+	if binPath != orig {
+		e.logf("[exec] path fallback: %s -> %s", orig, binPath)
 	}
 	cmd := exec.Command(binPath)
 	cmd.Args = req.Argv

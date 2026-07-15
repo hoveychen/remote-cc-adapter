@@ -134,3 +134,83 @@ func dialExec(t *testing.T, sock string) transport.Stream {
 	t.Fatalf("dial exec socket failed")
 	return nil
 }
+
+// TestResolveBinPath covers the cross-OS binary resolution order, especially the
+// claude ripgrep case: claude re-execs its own host-OS binary with argv[0]=rg,
+// so on a different-OS executor the requested path is absent and the copy's
+// basename ("rcc-claude-copy") resolves to nothing — the executor must fall back
+// to argv[0]'s basename ("rg"), then to a bundled ripgrep when the host has none.
+func TestResolveBinPath(t *testing.T) {
+	// fake stat: only paths in `present` exist.
+	statWith := func(present map[string]bool) func(string) (os.FileInfo, error) {
+		return func(p string) (os.FileInfo, error) {
+			if present[p] {
+				return nil, nil
+			}
+			return nil, os.ErrNotExist
+		}
+	}
+	// fake lookPath: only basenames in `onPath` resolve, to /usr/bin/<name>.
+	lookWith := func(onPath map[string]bool) func(string) (string, error) {
+		return func(name string) (string, error) {
+			if onPath[name] {
+				return "/usr/bin/" + name, nil
+			}
+			return "", os.ErrNotExist
+		}
+	}
+	claudeCopy := "/private/var/folders/x/rcc-claude-copy"
+
+	cases := []struct {
+		name       string
+		reqPath    string
+		argv       []string
+		embeddedRg string
+		present    map[string]bool
+		onPath     map[string]bool
+		want       string
+	}{
+		{
+			name:    "present path used as-is",
+			reqPath: "/bin/zsh", argv: []string{"/bin/zsh", "-c", "x"},
+			present: map[string]bool{"/bin/zsh": true},
+			want:    "/bin/zsh",
+		},
+		{
+			name:    "absent path resolves by its own basename",
+			reqPath: "/bin/zsh", argv: []string{"/bin/zsh", "-c", "x"},
+			onPath: map[string]bool{"zsh": true},
+			want:   "/usr/bin/zsh",
+		},
+		{
+			name:    "claude rg: copy absent, host has rg -> native rg via argv0",
+			reqPath: claudeCopy, argv: []string{"rg", "--files"},
+			onPath: map[string]bool{"rg": true}, // rcc-claude-copy not on PATH
+			want:   "/usr/bin/rg",
+		},
+		{
+			name:    "claude rg: copy absent, no host rg -> bundled rg",
+			reqPath: claudeCopy, argv: []string{"rg", "--files"},
+			embeddedRg: "/cache/rca/rg",
+			want:       "/cache/rca/rg",
+		},
+		{
+			name:    "claude rg: no host rg and no bundle -> original (degrade)",
+			reqPath: claudeCopy, argv: []string{"rg", "--files"},
+			want: claudeCopy,
+		},
+		{
+			name:    "bare name passes through for child PATH search",
+			reqPath: "", argv: []string{"git", "status"},
+			want: "git",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := resolveBinPathWith(c.reqPath, c.argv, c.embeddedRg, statWith(c.present), lookWith(c.onPath))
+			if got != c.want {
+				t.Errorf("resolveBinPath = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

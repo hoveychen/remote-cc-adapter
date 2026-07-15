@@ -31,12 +31,21 @@ type Logger interface {
 type Executor struct {
 	ln     transport.Listener
 	logger Logger
+	// embeddedRg is a bundled ripgrep this host runs when a routed rg spawn
+	// references a binary absent here (cross-OS, claude re-execs its own host-OS
+	// binary with argv[0]=rg). Empty disables the fallback. Set via SetEmbeddedRg.
+	embeddedRg string
 }
 
 // New builds an executor serving on ln.
 func New(ln transport.Listener, logger Logger) *Executor {
 	return &Executor{ln: ln, logger: logger}
 }
+
+// SetEmbeddedRg configures a bundled ripgrep the executor runs when a routed
+// rg spawn (argv[0] basename "rg") references a binary path that does not exist
+// on this host and this host has no rg of its own. Empty leaves the fallback off.
+func (e *Executor) SetEmbeddedRg(path string) { e.embeddedRg = path }
 
 // Serve accepts streams until the listener is closed. Each stream is handled in
 // its own goroutine.
