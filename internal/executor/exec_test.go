@@ -214,3 +214,53 @@ func TestResolveBinPath(t *testing.T) {
 		})
 	}
 }
+
+// TestAppendPath covers exposing the bundled ripgrep dir on a routed child's
+// PATH so a bare `rg` resolves (Gap A: codex prefers rg via its shell).
+func TestAppendPath(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	cases := []struct {
+		name string
+		env  []string
+		dir  string
+		want []string
+	}{
+		{
+			name: "append after existing PATH",
+			env:  []string{"HOME=/h", "PATH=/usr/bin" + sep + "/bin", "X=1"},
+			dir:  "/cache/rg",
+			want: []string{"HOME=/h", "PATH=/usr/bin" + sep + "/bin" + sep + "/cache/rg", "X=1"},
+		},
+		{
+			name: "empty PATH becomes the dir",
+			env:  []string{"PATH="},
+			dir:  "/cache/rg",
+			want: []string{"PATH=/cache/rg"},
+		},
+		{
+			name: "no PATH entry gets one",
+			env:  []string{"HOME=/h"},
+			dir:  "/cache/rg",
+			want: []string{"HOME=/h", "PATH=/cache/rg"},
+		},
+		{
+			name: "empty dir is a no-op",
+			env:  []string{"PATH=/usr/bin"},
+			dir:  "",
+			want: []string{"PATH=/usr/bin"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := appendPath(c.env, c.dir)
+			if len(got) != len(c.want) {
+				t.Fatalf("len %d != %d: %v", len(got), len(c.want), got)
+			}
+			for i := range c.want {
+				if got[i] != c.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}

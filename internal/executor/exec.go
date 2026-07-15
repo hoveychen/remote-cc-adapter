@@ -59,6 +59,33 @@ func resolveBinPathWith(reqPath string, argv []string, embeddedRg string,
 	return binPath
 }
 
+// appendPath returns env with dir appended to its PATH entry (adding a PATH
+// entry if none exists), so a bare command in dir resolves after the host's own
+// copies. dir empty is a no-op.
+func appendPath(env []string, dir string) []string {
+	if dir == "" {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	found := false
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
+			if v == "" {
+				out = append(out, "PATH="+dir)
+			} else {
+				out = append(out, "PATH="+v+string(os.PathListSeparator)+dir)
+			}
+			found = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !found {
+		out = append(out, "PATH="+dir)
+	}
+	return out
+}
+
 // serveExec runs one subprocess on the executor host on behalf of a connected
 // spawn proxy. It reads the SpawnRequest header, launches the process, pumps
 // stdout/stderr back as tagged frames, forwards signals the proxy relays, and
@@ -109,6 +136,13 @@ func (e *Executor) serveExec(stream io.ReadWriteCloser) {
 	// and forward its own filesystem ops back to the adapter — a re-injection
 	// loop / metadata storm. Then mark it as running remotely.
 	cmd.Env = append(scrubInjectionEnv(base), "RCC_EXECUTOR=1")
+	// Expose the bundled ripgrep on the child's PATH so a bare `rg` in a routed
+	// shell command (e.g. codex, which prefers rg) resolves even when this host
+	// has no rg of its own. Appended, not prepended, so a real system rg still
+	// wins — matching resolveBinPath's "native first, bundled fallback" order.
+	if e.embeddedRg != "" {
+		cmd.Env = appendPath(cmd.Env, filepath.Dir(e.embeddedRg))
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
