@@ -328,3 +328,21 @@ func TestOSHintArgs(t *testing.T) {
 		}
 	})
 }
+
+// TestCrossOSExtraArgs guards the fix for the cross-OS 127: codex wraps commands
+// in the macOS Seatbelt sandbox (/usr/bin/sandbox-exec), which is absent on a
+// Linux executor, so every routed command exits 127. On a cross-OS launch run
+// mode must inject -s danger-full-access to disable codex's local sandbox.
+func TestCrossOSExtraArgs(t *testing.T) {
+	if got := profileCrossOSExtraArgs("codex"); !reflect.DeepEqual(got, []string{"-s", "danger-full-access"}) {
+		t.Errorf("codex cross-OS args = %v, want [-s danger-full-access]", got)
+	}
+	// claude sandboxes differently and does not break cross-OS this way; nothing
+	// extra needed.
+	if got := profileCrossOSExtraArgs("claude"); got != nil {
+		t.Errorf("claude needs no cross-OS extra args, got %v", got)
+	}
+	if got := profileCrossOSExtraArgs("hermes"); got != nil {
+		t.Errorf("unknown engine should yield no cross-OS args, got %v", got)
+	}
+}

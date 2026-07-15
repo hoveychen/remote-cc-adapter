@@ -48,6 +48,18 @@ type engineProfile struct {
 	// osHintFlag empty means the engine has no injection mechanism (no hint).
 	osHintFlag        string
 	osHintValuePrefix string
+
+	// crossOSExtraArgs are args the engine needs to FUNCTION (not merely choose
+	// better commands) when its subprocesses run on a different-OS executor. codex
+	// sandboxes its shell with the local OS's mechanism — on macOS it wraps every
+	// command in /usr/bin/sandbox-exec (Seatbelt). That wrapper binary does not
+	// exist on a Linux executor, so each routed command dies with
+	// "fork/exec /usr/bin/sandbox-exec: no such file" (exit 127). Passing
+	// -s danger-full-access disables codex's own sandbox so it spawns the shell
+	// directly; the executor host is the isolation boundary and the local sandbox
+	// could never apply to remote execution anyway. Injected only on a cross-OS
+	// launch (see run.go). Empty for engines that need nothing extra.
+	crossOSExtraArgs []string
 }
 
 // engineProfiles maps an engine name (the target command's basename) to its
@@ -90,6 +102,12 @@ var engineProfiles = map[string]engineProfile{
 		// whole base prompt, so it is not used.)
 		osHintFlag:        "-c",
 		osHintValuePrefix: "developer_instructions=",
+		// Disable codex's local (macOS Seatbelt) sandbox on cross-OS launches so
+		// its /usr/bin/sandbox-exec wrapper is not routed to a Linux executor that
+		// lacks it. Verified 2026-07 against codex-cli 0.144.4: with
+		// -s danger-full-access codex spawns /bin/zsh directly (no sandbox-exec)
+		// and `uname -s` on a Linux executor returns "Linux" instead of 127.
+		crossOSExtraArgs: []string{"-s", "danger-full-access"},
 		// codex 0.144.4+ "code mode" runs shell commands through a persistent
 		// sibling helper, codex-code-mode-host, which it execs from its own
 		// bin dir; that helper then spawns the actual shell (/bin/sh -lc ...).
@@ -157,6 +175,19 @@ func profileSpawnHelpers(profile string) []string {
 		return nil
 	}
 	return append([]string(nil), p.spawnHelpers...)
+}
+
+// profileCrossOSExtraArgs returns args to prepend on a cross-OS launch so the
+// engine can function when its subprocesses run on a different-OS executor (e.g.
+// codex: disable its local sandbox). Empty for an unknown engine or one needing
+// nothing extra. The caller injects these only when the executor OS differs from
+// the local OS (see run.go); this accessor itself does not check the OS.
+func profileCrossOSExtraArgs(profile string) []string {
+	p, ok := engineProfiles[profile]
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), p.crossOSExtraArgs...)
 }
 
 // osHintArgs returns argv to prepend to the engine's own arguments so the agent
