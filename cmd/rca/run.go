@@ -426,12 +426,31 @@ func cmdRun(args []string) int {
 	// probe is best-effort: on any failure (short timeout, or an old executor
 	// that predates OpServerInfo) we skip the hint rather than block the launch.
 	{
-		qctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		execOS, execArch, qerr := adapter.QueryServerInfo(qctx, dialer)
-		cancel()
+		// A relayed executor can need more than one attempt: the first dial may
+		// spend its whole deadline walking the pairing code's unreachable
+		// private addrs into backoff before the circuit address wins (observed
+		// 2026-07-19, mac → own-api-ko via relay: a 10s one-shot probe timed
+		// out while the session's first real fs op connected moments later).
+		// Retry once with the backoff already primed — cross-OS is exactly the
+		// remote case relays serve, so this is where the hint matters most. An
+		// old executor that predates OpServerInfo fails fast, so the retry
+		// costs nothing there.
+		var (
+			execOS, execArch string
+			qerr             error
+		)
+		for attempt := 1; attempt <= 2; attempt++ {
+			qctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			execOS, execArch, qerr = adapter.QueryServerInfo(qctx, dialer)
+			cancel()
+			if qerr == nil {
+				break
+			}
+			logger.Printf("executor OS probe attempt %d failed: %v", attempt, qerr)
+		}
 		switch {
 		case qerr != nil:
-			logger.Printf("executor OS probe failed (%v) — skipping cross-OS hint", qerr)
+			logger.Printf("executor OS probe gave up — skipping cross-OS hint")
 		case execOS == runtime.GOOS:
 			// Same-OS deployment (incl. co-located): nothing to reconcile.
 		default:
