@@ -37,6 +37,7 @@ type runOpts struct {
 	code string // pairing code from `rca serve`
 	peer string // raw libp2p peer multiaddr (alternative to code)
 	sock string // co-located executor unix socket (alternative to code)
+	via  string // spawn this command and speak yamux over its stdin/stdout (ssh transport)
 
 	workdir        string
 	remotePrefixes []string
@@ -68,6 +69,7 @@ var ownedFlags = map[string]int{
 	"code":           kindString,
 	"peer":           kindString,
 	"sock":           kindString,
+	"via":            kindString,
 	"workdir":        kindString,
 	"remote-prefix":  kindStringList,
 	"local-prefix":   kindStringList,
@@ -100,6 +102,8 @@ func parseRunArgs(args []string) (*runOpts, error) {
 			o.peer = val
 		case "sock":
 			o.sock = val
+		case "via":
+			o.via = val
 		case "workdir":
 			o.workdir = val
 		case "profile":
@@ -194,8 +198,8 @@ func parseRunArgs(args []string) (*runOpts, error) {
 	if o.command == "" && !o.serveFSOnly {
 		return nil, fmt.Errorf("rca: no command given (usage: rca <command> [args...] --code <pairing-code>)")
 	}
-	if n := btoi(o.code != "") + btoi(o.peer != "") + btoi(o.sock != ""); n != 1 {
-		return nil, fmt.Errorf("rca: exactly one of --code, --peer or --sock is required (got %d)", n)
+	if n := btoi(o.code != "") + btoi(o.peer != "") + btoi(o.sock != "") + btoi(o.via != ""); n != 1 {
+		return nil, fmt.Errorf("rca: exactly one of --code, --peer, --sock or --via is required (got %d)", n)
 	}
 	return o, nil
 }
@@ -205,6 +209,24 @@ func btoi(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// viaCloser tears down a --via child process (e.g. ssh) when the stdio dialer
+// closes: close its stdin, kill it, and reap it.
+type viaCloser struct {
+	cmd *exec.Cmd
+	in  interface{ Close() error }
+}
+
+func (v viaCloser) Close() error {
+	if v.in != nil {
+		_ = v.in.Close()
+	}
+	if v.cmd != nil && v.cmd.Process != nil {
+		_ = v.cmd.Process.Kill()
+		return v.cmd.Wait()
+	}
+	return nil
 }
 
 func cmdRun(args []string) int {
@@ -347,6 +369,35 @@ func cmdRun(args []string) int {
 	// (libp2p) or a co-located unix socket.
 	var dialer transport.Dialer
 	switch {
+	case o.via != "":
+		// Spawn the via-command (e.g. `ssh host rca serve --stdio`) and speak
+		// yamux over its stdin/stdout — the ssh-friendly single-pipe transport.
+		// ssh only ever sees one long-lived byte stream (no multi-connection
+		// forwarding, no half-close for ssh to mistranslate), so it carries the
+		// executor protocol verbatim. No libp2p, no pairing code.
+		viaCmd := exec.Command("sh", "-c", o.via)
+		viaCmd.Stderr = os.Stderr
+		outPipe, err := viaCmd.StdoutPipe()
+		if err != nil {
+			logger.Printf("via stdout: %v", err)
+			return 1
+		}
+		inPipe, err := viaCmd.StdinPipe()
+		if err != nil {
+			logger.Printf("via stdin: %v", err)
+			return 1
+		}
+		if err := viaCmd.Start(); err != nil {
+			logger.Printf("via start (%q): %v", o.via, err)
+			return 1
+		}
+		d, err := transport.NewStdioDialer(outPipe, inPipe, viaCloser{cmd: viaCmd, in: inPipe})
+		if err != nil {
+			logger.Printf("via dialer: %v", err)
+			return 1
+		}
+		dialer = d
+		logger.Printf("executor transport: stdio via %q", o.via)
 	case o.code != "" || o.peer != "":
 		h, err := transport.NewLibp2pHost(transport.HostConfig{
 			ListenAddrs:        []string{"/ip4/0.0.0.0/tcp/0"},

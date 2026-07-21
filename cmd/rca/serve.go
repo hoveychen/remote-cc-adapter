@@ -21,6 +21,8 @@ import (
 func cmdServe(args []string) int {
 	fs := flag.NewFlagSet("rca serve", flag.ExitOnError)
 	sock := fs.String("sock", "", "unix socket path to listen on (co-located mode; disables libp2p)")
+	stdio := fs.Bool("stdio", false, "serve over stdin/stdout via yamux (for `ssh host rca serve --stdio`); "+
+		"no libp2p, no pairing code. Nothing else may write to stdout in this mode.")
 	listen := fs.String("listen", "/ip4/0.0.0.0/tcp/0", "comma-separated libp2p listen multiaddrs")
 	holePunch := fs.Bool("hole-punch", true, "enable DCUtR hole-punching in libp2p mode")
 	relays := fs.String("relays", "", "comma-separated circuit-relay peer multiaddrs (fallback)")
@@ -38,6 +40,14 @@ func cmdServe(args []string) int {
 		var err error
 		if ln, err = transport.ListenUnix(*sock); err != nil {
 			logger.Printf("listen: %v", err)
+			return 1
+		}
+	} else if *stdio {
+		// stdin/stdout ARE the transport now; the logger is on stderr and no
+		// pairing code is printed, so stdout carries only yamux frames.
+		var err error
+		if ln, err = transport.NewStdioListener(os.Stdin, os.Stdout, nil); err != nil {
+			logger.Printf("listen stdio: %v", err)
 			return 1
 		}
 	} else {
