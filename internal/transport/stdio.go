@@ -39,11 +39,11 @@ func (p *pipeConn) Close() error {
 	}
 	return nil
 }
-func (p *pipeConn) LocalAddr() net.Addr                { return stdioAddr{} }
-func (p *pipeConn) RemoteAddr() net.Addr               { return stdioAddr{} }
-func (p *pipeConn) SetDeadline(time.Time) error        { return nil }
-func (p *pipeConn) SetReadDeadline(time.Time) error    { return nil }
-func (p *pipeConn) SetWriteDeadline(time.Time) error   { return nil }
+func (p *pipeConn) LocalAddr() net.Addr              { return stdioAddr{} }
+func (p *pipeConn) RemoteAddr() net.Addr             { return stdioAddr{} }
+func (p *pipeConn) SetDeadline(time.Time) error      { return nil }
+func (p *pipeConn) SetReadDeadline(time.Time) error  { return nil }
+func (p *pipeConn) SetWriteDeadline(time.Time) error { return nil }
 
 type stdioAddr struct{}
 
